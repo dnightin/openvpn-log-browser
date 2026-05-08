@@ -1,0 +1,14 @@
+{
+  "name": "openvpn-log-search",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Search authorized OpenVPN CloudConnexa JSONL logs from S3 or local cache.",
+  "scripts": {
+    "start": "node server.js",
+    "ingest": "node server.js --ingest",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
