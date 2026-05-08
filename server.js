@@ -530,6 +530,8 @@ const INDEX_HTML = `<!doctype html>
     const statsEl = document.querySelector("#stats");
     const sourceLine = document.querySelector("#sourceLine");
     const closeDetail = document.querySelector("#closeDetail");
+    const IDLE_RELOAD_MS = 30 * 60 * 1000;
+    let idleReloadTimer;
 
     async function getJson(url, options) {
       const res = await fetch(url, options);
@@ -632,6 +634,25 @@ const INDEX_HTML = `<!doctype html>
       details.textContent = "Select a log event.";
     });
 
+    function resetIdleReloadTimer() {
+      clearTimeout(idleReloadTimer);
+      idleReloadTimer = setTimeout(async () => {
+        statusEl.textContent = "Idle refresh...";
+        try {
+          await getJson("/api/reload", { method: "POST" });
+          await boot();
+        } catch (error) {
+          showError(error);
+        } finally {
+          resetIdleReloadTimer();
+        }
+      }, IDLE_RELOAD_MS);
+    }
+
+    ["click", "keydown", "mousemove", "scroll", "touchstart"].forEach(eventName => {
+      window.addEventListener(eventName, resetIdleReloadTimer, { passive: true });
+    });
+
     function formatDuration(seconds) {
       seconds = Number(seconds || 0);
       if (!seconds) return "-";
@@ -677,6 +698,7 @@ const INDEX_HTML = `<!doctype html>
       await loadStats();
       await loadFacets();
       await search();
+      resetIdleReloadTimer();
     }
 
     boot().catch(showError);
