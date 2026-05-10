@@ -11,6 +11,7 @@ const PORT = Number(process.env.PORT || 3000);
 const BUCKET_URL = ensureTrailingSlash(process.env.S3_BUCKET_URL || "https://wc-openvpnlogs.s3.us-east-1.amazonaws.com/");
 const LOG_PREFIX = process.env.LOG_PREFIX || "CloudConnexa/wellesley/";
 const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
+const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 25));
 const SECRET_KEY_RE = /(token|secret|password|credential|private.?key|client.?key|refresh|bearer|session)/i;
 
 let store = {
@@ -18,8 +19,9 @@ let store = {
   objects: [],
   source: "not loaded",
   loadedAt: null,
-  error: null
+  error: "Loading logs..."
 };
+let refreshPromise = null;
 
 function ensureTrailingSlash(value) {
   return value.endsWith("/") ? value : `${value}/`;
@@ -83,8 +85,18 @@ function decodeXml(value) {
 }
 
 async function listBucketObjects() {
-  const xml = (await httpGetBuffer(BUCKET_URL)).toString("utf8");
-  return parseS3List(xml);
+  const objects = [];
+  let marker = "";
+  for (;;) {
+    const pageUrl = marker ? `${BUCKET_URL}?marker=${encodeURIComponent(marker)}` : BUCKET_URL;
+    const xml = (await httpGetBuffer(pageUrl)).toString("utf8");
+    const pageObjects = parseS3List(xml);
+    objects.push(...pageObjects);
+    const isTruncated = xmlText(xml, "IsTruncated").toLowerCase() === "true";
+    if (!isTruncated || pageObjects.length === 0) break;
+    marker = pageObjects[pageObjects.length - 1].key;
+  }
+  return objects.sort((a, b) => a.key.localeCompare(b.key));
 }
 
 async function walk(dir) {
@@ -215,10 +227,14 @@ async function parseObject(compressed, key) {
 async function loadFromS3() {
   const objects = await listBucketObjects();
   const records = [];
-  for (const object of objects) {
-    const url = BUCKET_URL + object.key.split("/").map(encodeURIComponent).join("/");
-    const compressed = await httpGetBuffer(url);
-    records.push(...await parseObject(compressed, object.key));
+  for (let index = 0; index < objects.length; index += FETCH_CONCURRENCY) {
+    const batch = objects.slice(index, index + FETCH_CONCURRENCY);
+    const batchRecords = await Promise.all(batch.map(async (object) => {
+      const url = BUCKET_URL + object.key.split("/").map(encodeURIComponent).join("/");
+      const compressed = await httpGetBuffer(url);
+      return parseObject(compressed, object.key);
+    }));
+    for (const objectRecords of batchRecords) records.push(...objectRecords);
   }
   return { records, objects, source: BUCKET_URL };
 }
@@ -240,6 +256,14 @@ async function loadFromRawDir() {
 }
 
 async function refresh() {
+  if (refreshPromise) return refreshPromise;
+  refreshPromise = refreshNow().finally(() => {
+    refreshPromise = null;
+  });
+  return refreshPromise;
+}
+
+async function refreshNow() {
   store = { ...store, error: null };
   try {
     store = { ...await loadFromS3(), loadedAt: new Date().toISOString(), error: null };
@@ -272,7 +296,7 @@ function filterRecords(params) {
   const gateway = params.get("gateway") || "";
   const start = params.get("start") || "";
   const end = params.get("end") || "";
-  const limit = Math.min(Number(params.get("limit") || 200), 1000);
+  const limit = Math.min(Number(params.get("limit") || 1000), 10000);
 
   const rows = store.records
     .filter((record) => !q || record.searchText.includes(q))
@@ -284,7 +308,7 @@ function filterRecords(params) {
     .filter((record) => !end || record.timestamp <= end)
     .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 
-  return { total: rows.length, rows: rows.slice(0, limit) };
+  return { searched: store.records.length, total: rows.length, limit, rows: rows.slice(0, limit) };
 }
 
 function facets() {
@@ -296,6 +320,132 @@ function facets() {
     users: unique(store.records.map((record) => record.userName)).slice(0, 25),
     ips: unique(store.records.map((record) => record.publicIp)).slice(0, 25)
   };
+}
+
+function userChurnSummary(userName) {
+  if (!userName) {
+    return {
+      userName: "",
+      connected: 0,
+      disconnected: 0,
+      total: 0,
+      shortSessions: 0,
+      totalTransfer: 0,
+      windowHours: 24,
+      severity: "none",
+      message: "No user identity on this event."
+    };
+  }
+
+  const windowHours = 24;
+  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
+  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const cutoff = newest - (windowHours * 60 * 60 * 1000);
+  const userRecords = store.records.filter((record) => {
+    if ((record.userName || record.parentEntityName || record.initiatorName) !== userName) return false;
+    const ts = Date.parse(record.timestamp);
+    return Number.isFinite(ts) && ts >= cutoff;
+  });
+
+  const connected = userRecords.filter((record) => record.eventName === "client-connected").length;
+  const disconnected = userRecords.filter((record) => record.eventName === "client-disconnected").length;
+  const shortSessions = userRecords.filter((record) => record.eventName === "client-disconnected" && record.durationSeconds > 0 && record.durationSeconds <= 60).length;
+  const totalTransfer = userRecords.reduce((sum, record) => sum + (record.bytesIn || 0) + (record.bytesOut || 0), 0);
+  const total = connected + disconnected;
+  let severity = "normal";
+  if (total >= 100 || shortSessions >= 25) severity = "high";
+  else if (total >= 40 || shortSessions >= 10) severity = "elevated";
+
+  const latest = userRecords
+    .filter((record) => record.eventName === "client-connected" || record.eventName === "client-disconnected")
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    .slice(0, 8)
+    .map((record) => ({
+      timestamp: record.timestamp,
+      eventName: record.eventName,
+      deviceName: record.deviceName,
+      publicIp: record.publicIp,
+      gateway: record.gateway,
+      durationSeconds: record.durationSeconds,
+      disconnectReason: record.disconnectReason
+    }));
+
+  return {
+    userName,
+    connected,
+    disconnected,
+    total,
+    shortSessions,
+    totalTransfer,
+    windowHours,
+    severity,
+    message: churnMessage(severity, total, shortSessions, windowHours),
+    latest
+  };
+}
+
+function churnLeaderboard(limit = 10) {
+  const windowHours = 24;
+  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
+  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const cutoff = newest - (windowHours * 60 * 60 * 1000);
+  const users = new Map();
+
+  for (const record of store.records) {
+    if (record.eventName !== "client-connected" && record.eventName !== "client-disconnected") continue;
+    const ts = Date.parse(record.timestamp);
+    if (!Number.isFinite(ts) || ts < cutoff) continue;
+    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    if (!userName) continue;
+    if (!users.has(userName)) {
+      users.set(userName, {
+        userName,
+        connected: 0,
+        disconnected: 0,
+        shortSessions: 0,
+        totalTransfer: 0,
+        latestTimestamp: ""
+      });
+    }
+    const user = users.get(userName);
+    if (record.eventName === "client-connected") user.connected += 1;
+    if (record.eventName === "client-disconnected") user.disconnected += 1;
+    if (record.eventName === "client-disconnected" && record.durationSeconds > 0 && record.durationSeconds <= 60) user.shortSessions += 1;
+    user.totalTransfer += (record.bytesIn || 0) + (record.bytesOut || 0);
+    if (record.timestamp > user.latestTimestamp) user.latestTimestamp = record.timestamp;
+  }
+
+  const rows = [...users.values()].map((user) => {
+    const total = user.connected + user.disconnected;
+    let severity = "normal";
+    if (total >= 100 || user.shortSessions >= 25) severity = "high";
+    else if (total >= 40 || user.shortSessions >= 10) severity = "elevated";
+    return {
+      ...user,
+      total,
+      severity,
+      message: churnMessage(severity, total, user.shortSessions, windowHours)
+    };
+  }).sort((a, b) => {
+    const severityRank = { high: 2, elevated: 1, normal: 0 };
+    return severityRank[b.severity] - severityRank[a.severity]
+      || b.total - a.total
+      || b.shortSessions - a.shortSessions
+      || b.latestTimestamp.localeCompare(a.latestTimestamp);
+  });
+
+  return {
+    windowHours,
+    generatedAt: new Date(newest).toISOString(),
+    excessiveCount: rows.filter((row) => row.severity === "high" || row.severity === "elevated").length,
+    users: rows.slice(0, limit)
+  };
+}
+
+function churnMessage(severity, total, shortSessions, windowHours) {
+  if (severity === "high") return `High reconnect activity: ${total} connect/disconnect events and ${shortSessions} short sessions in the last ${windowHours} hours.`;
+  if (severity === "elevated") return `Elevated reconnect activity: ${total} connect/disconnect events and ${shortSessions} short sessions in the last ${windowHours} hours.`;
+  return `No excessive reconnect pattern detected in the last ${windowHours} hours.`;
 }
 
 function unique(values) {
@@ -330,16 +480,21 @@ function stats() {
     }
   }
   const activeSessions = [...sessionLatest.values()].filter((record) => record.eventName === "client-connected").length;
+  const activeUsers = unique([...sessionLatest.values()]
+    .filter((record) => record.eventName === "client-connected")
+    .map((record) => record.userName || record.parentEntityName || record.initiatorName)).length;
   return {
     records: store.records.length,
     objects: store.objects.length,
     activeSessions,
+    activeUsers,
     byEvent,
     totalBytesIn,
     totalBytesOut,
     source: store.source,
     loadedAt: store.loadedAt,
     error: store.error,
+    loading: Boolean(refreshPromise),
     firstTimestamp: timestamps[0] || "",
     lastTimestamp: timestamps[timestamps.length - 1] || "",
     byDay
@@ -370,6 +525,10 @@ async function handler(req, res) {
     if (url.pathname === "/") return html(res);
     if (url.pathname === "/api/stats") return json(res, stats());
     if (url.pathname === "/api/facets") return json(res, facets());
+    if (url.pathname === "/api/churn") {
+      const limit = Math.min(Number(url.searchParams.get("limit") || 10), 50);
+      return json(res, churnLeaderboard(limit));
+    }
     if (url.pathname === "/api/search") {
       const result = filterRecords(url.searchParams);
       return json(res, {
@@ -381,7 +540,7 @@ async function handler(req, res) {
       const id = url.searchParams.get("id");
       const record = store.records.find((item) => item.id === id);
       if (!record) return notFound(res);
-      return json(res, { ...record, searchText: undefined, raw: redact(record.raw) });
+      return json(res, { ...record, searchText: undefined, raw: redact(record.raw), churn: userChurnSummary(record.userName || record.parentEntityName || record.initiatorName) });
     }
     if (url.pathname === "/api/reload" && req.method === "POST") {
       await refresh();
@@ -423,7 +582,7 @@ const INDEX_HTML = `<!doctype html>
     .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
     .stat strong { display: block; font-size: 20px; }
     .stat span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 160px 170px 150px 190px 150px 150px auto; gap: 8px; align-items: end; margin-bottom: 14px; }
+    .toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 150px 160px 130px 170px 140px 140px 110px auto auto; gap: 8px; align-items: end; margin-bottom: 14px; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
     input, select, button { height: 38px; border-radius: 7px; border: 1px solid var(--line); background: white; color: var(--text); padding: 0 10px; font: inherit; min-width: 0; }
     button { background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 700; }
@@ -448,6 +607,27 @@ const INDEX_HTML = `<!doctype html>
     .details { padding: 12px 14px; }
     .kv { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 6px 10px; font-size: 13px; margin-bottom: 12px; }
     .kv div:nth-child(odd) { color: var(--muted); }
+    .churn { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 12px; background: #fbfcfe; }
+    .churn h3 { margin: 0 0 8px; font-size: 13px; }
+    .churn .summary { margin-bottom: 8px; font-size: 13px; color: var(--muted); }
+    .churn.elevated { border-color: #d99a2b; background: #fff8eb; }
+    .churn.high { border-color: var(--danger); background: #fff1f2; }
+    .mini-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
+    .mini-stat { border: 1px solid var(--line); border-radius: 7px; padding: 7px; background: white; min-width: 0; }
+    .mini-stat strong { display: block; font-size: 16px; }
+    .mini-stat span { color: var(--muted); font-size: 11px; }
+    .mini-list { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+    .mini-list div { overflow-wrap: anywhere; }
+    .watch { border-bottom: 1px solid var(--line); padding: 12px 14px; }
+    .watch-title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+    .watch-title h3 { margin: 0; font-size: 13px; }
+    .watch-title span { color: var(--muted); font-size: 11px; }
+    .watch-list { display: grid; gap: 8px; }
+    .watch-user { border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: #fbfcfe; }
+    .watch-user.elevated { border-color: #d99a2b; background: #fff8eb; }
+    .watch-user.high { border-color: var(--danger); background: #fff1f2; }
+    .watch-user strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
+    .watch-user span { color: var(--muted); display: block; font-size: 12px; margin-top: 3px; }
     pre { margin: 0; padding: 12px; background: #0f172a; color: #dbeafe; border-radius: 8px; overflow: auto; max-height: 520px; font-size: 12px; line-height: 1.45; }
     .bars { display: flex; gap: 2px; align-items: end; height: 34px; margin-top: 8px; }
     .bar { background: var(--accent-2); min-width: 3px; flex: 1; border-radius: 2px 2px 0 0; opacity: .8; }
@@ -494,6 +674,16 @@ const INDEX_HTML = `<!doctype html>
       <label>End
         <input name="end" placeholder="2026-05-09">
       </label>
+      <label>Rows
+        <select name="limit">
+          <option value="1000">1000</option>
+          <option value="300">300</option>
+          <option value="2500">2500</option>
+          <option value="5000">5000</option>
+          <option value="10000">10000</option>
+        </select>
+      </label>
+      <button type="button" class="secondary" id="clearFilters">Clear</button>
       <button type="button" class="secondary" id="reload">Reload</button>
     </form>
     <div class="status" id="status"></div>
@@ -518,6 +708,7 @@ const INDEX_HTML = `<!doctype html>
           <h2>Event Detail</h2>
           <button type="button" class="icon-button" id="closeDetail" title="Close event detail" aria-label="Close event detail">&times;</button>
         </div>
+        <section class="watch" id="churnWatch"></section>
         <div class="details" id="details">Select a log event.</div>
       </aside>
     </section>
@@ -527,6 +718,7 @@ const INDEX_HTML = `<!doctype html>
     const rows = document.querySelector("#rows");
     const statusEl = document.querySelector("#status");
     const details = document.querySelector("#details");
+    const churnWatch = document.querySelector("#churnWatch");
     const statsEl = document.querySelector("#stats");
     const sourceLine = document.querySelector("#sourceLine");
     const closeDetail = document.querySelector("#closeDetail");
@@ -548,7 +740,6 @@ const INDEX_HTML = `<!doctype html>
       const form = new FormData(filters);
       const out = new URLSearchParams();
       for (const [key, value] of form.entries()) if (String(value).trim()) out.set(key, String(value).trim());
-      out.set("limit", "300");
       return out;
     }
 
@@ -558,6 +749,22 @@ const INDEX_HTML = `<!doctype html>
       fill("eventName", data.eventNames);
       fill("os", data.operatingSystems);
       fill("gateway", data.gateways);
+    }
+
+    async function loadChurnWatch() {
+      const data = await getJson("/api/churn?limit=8");
+      churnWatch.innerHTML = '<div class="watch-title"><h3>Reconnect Watch</h3><span>last ' + esc(data.windowHours) + 'h</span></div>' +
+        '<div class="watch-list">' + renderChurnUsers(data.users || [], data.excessiveCount) + '</div>';
+    }
+
+    function renderChurnUsers(users, excessiveCount) {
+      if (!users.length) return '<div class="muted">Loading reconnect activity...</div>';
+      const rows = excessiveCount ? users.filter(user => user.severity === "high" || user.severity === "elevated") : users.slice(0, 5);
+      if (!rows.length) return '<div class="muted">No excessive reconnect pattern detected.</div>';
+      return rows.map(user => '<div class="watch-user ' + esc(user.severity) + '">' +
+        '<strong>' + esc(user.userName) + '</strong>' +
+        '<span>' + esc(user.total) + ' events: ' + esc(user.connected) + ' connects, ' + esc(user.disconnected) + ' disconnects, ' + esc(user.shortSessions) + ' short sessions</span>' +
+      '</div>').join("");
     }
 
     function fill(name, values) {
@@ -570,14 +777,14 @@ const INDEX_HTML = `<!doctype html>
     async function loadStats() {
       const data = await getJson("/api/stats");
       sourceLine.textContent = data.source + " | loaded " + (data.loadedAt || "never");
-      statusEl.textContent = data.error || "";
+      statusEl.textContent = data.loading ? "Loading logs..." : (data.error || "");
       statusEl.className = data.error ? "status error" : "status";
       const days = Object.entries(data.byDay || {});
       const max = Math.max(1, ...days.map(([, count]) => count));
       statsEl.innerHTML = [
         stat("Records", data.records),
         stat("Objects", data.objects),
-        stat("Active sessions", data.activeSessions),
+        stat("Active users", data.activeUsers + " users / " + data.activeSessions + " sessions"),
         stat("Disconnected", (data.byEvent && data.byEvent["client-disconnected"]) || 0),
         stat("Transfer", formatBytes((data.totalBytesIn || 0) + (data.totalBytesOut || 0))),
         '<div class="stat"><strong>' + days.length + '</strong><span>active days</span><div class="bars">' + days.map(([day, count]) => '<div class="bar" title="' + esc(day + ": " + count) + '" style="height:' + Math.max(5, Math.round((count / max) * 34)) + 'px"></div>').join("") + '</div></div>'
@@ -590,7 +797,7 @@ const INDEX_HTML = `<!doctype html>
 
     async function search() {
       const data = await getJson("/api/search?" + params());
-      statusEl.textContent = (statusEl.className.includes("error") ? statusEl.textContent + " | " : "") + data.total + " matching events, showing " + data.rows.length;
+      statusEl.textContent = (statusEl.className.includes("error") ? statusEl.textContent + " | " : "") + "searched " + data.searched + " loaded events; " + data.total + " matched; showing " + data.rows.length + " of " + data.limit;
       rows.innerHTML = data.rows.map(record => '<tr data-id="' + esc(record.id) + '">' +
         '<td class="time">' + esc(record.timestamp.replace("T", " ").replace("Z", "")) + '</td>' +
         '<td class="user">' + esc(record.userName || record.initiatorName) + '</td>' +
@@ -622,11 +829,37 @@ const INDEX_HTML = `<!doctype html>
         kv("Disconnect", record.disconnectReason) +
         kv("Trace ID", record.traceId) +
         kv("Source", record.sourceKey + ":" + record.lineNumber) +
-      '</div><pre>' + esc(JSON.stringify(record.raw, null, 2)) + '</pre>';
+      '</div>' + churnPanel(record.churn) + '<pre>' + esc(JSON.stringify(record.raw, null, 2)) + '</pre>';
     }
 
     function kv(key, value) {
       return '<div>' + esc(key) + '</div><div>' + esc(value || "-") + '</div>';
+    }
+
+    function churnPanel(churn) {
+      if (!churn) return "";
+      const recent = (churn.latest || []).map(item => '<div>' +
+        esc(item.timestamp.replace("T", " ").replace("Z", "")) + " | " +
+        esc(item.eventName) + " | " +
+        esc(item.deviceName || "-") + " | " +
+        esc(item.publicIp || "-") +
+        (item.durationSeconds ? " | " + esc(formatDuration(item.durationSeconds)) : "") +
+      '</div>').join("");
+      return '<section class="churn ' + esc(churn.severity) + '">' +
+        '<h3>Reconnect Activity</h3>' +
+        '<div class="summary">' + esc(churn.message) + '</div>' +
+        '<div class="mini-grid">' +
+          miniStat(churn.connected, "connects") +
+          miniStat(churn.disconnected, "disconnects") +
+          miniStat(churn.shortSessions, "short sessions") +
+          miniStat(formatBytes(churn.totalTransfer), "transfer") +
+        '</div>' +
+        '<div class="mini-list">' + (recent || '<div>No recent connection events for this user.</div>') + '</div>' +
+      '</section>';
+    }
+
+    function miniStat(value, label) {
+      return '<div class="mini-stat"><strong>' + esc(value) + '</strong><span>' + esc(label) + '</span></div>';
     }
 
     closeDetail.addEventListener("click", () => {
@@ -688,6 +921,10 @@ const INDEX_HTML = `<!doctype html>
       await getJson("/api/reload", { method: "POST" });
       await boot();
     });
+    document.querySelector("#clearFilters").addEventListener("click", () => {
+      filters.reset();
+      search().catch(showError);
+    });
 
     function showError(error) {
       statusEl.textContent = error.message;
@@ -697,6 +934,7 @@ const INDEX_HTML = `<!doctype html>
     async function boot() {
       await loadStats();
       await loadFacets();
+      await loadChurnWatch();
       await search();
       resetIdleReloadTimer();
     }
@@ -714,13 +952,11 @@ if (process.argv.includes("--ingest")) {
     process.exit(1);
   });
 } else {
-  refresh().then(() => {
-    http.createServer(handler).listen(PORT, () => {
-      console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
-      if (store.error) console.warn(store.error);
+  http.createServer(handler).listen(PORT, () => {
+    console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
+    refresh().catch((error) => {
+      store = { ...store, error: error.message };
+      console.error(error);
     });
-  }).catch((error) => {
-    console.error(error);
-    process.exit(1);
   });
 }
