@@ -19,7 +19,7 @@ node server.js --ingest
 By default the app reads from:
 
 ```text
-https://wc-openvpnlogs.s3.us-east-1.amazonaws.com/
+https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
 ```
 
 If the current machine cannot list the bucket, run it on `ospf1` or place `.jsonl.gz` files under `data/raw/` and start again.
