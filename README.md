@@ -28,7 +28,7 @@ If the current machine cannot list the bucket, run it on `ospf1` or place `.json
 
 ```text
 PORT=3000
-S3_BUCKET_URL=https://wc-openvpnlogs.s3.us-east-1.amazonaws.com/
+S3_BUCKET_URL=https://BUCKET-NAME>.s3.us-east-1.amazonaws.com/
 LOG_PREFIX=CloudConnexa/wellesley/
 RAW_DIR=data/raw
 ```
