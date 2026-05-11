@@ -543,7 +543,10 @@ async function handler(req, res) {
       return json(res, { ...record, searchText: undefined, raw: redact(record.raw), churn: userChurnSummary(record.userName || record.parentEntityName || record.initiatorName) });
     }
     if (url.pathname === "/api/reload" && req.method === "POST") {
-      await refresh();
+      refresh().catch((error) => {
+        store = { ...store, error: error.message };
+        console.error(error);
+      });
       return json(res, stats());
     }
     return notFound(res);
@@ -573,11 +576,11 @@ const INDEX_HTML = `<!doctype html>
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text); }
+    body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; }
     header { background: #111827; color: white; padding: 18px 24px; }
     header h1 { margin: 0; font-size: 22px; font-weight: 720; letter-spacing: 0; }
     header .sub { margin-top: 4px; color: #cbd5e1; font-size: 13px; }
-    main { padding: 18px 24px 28px; max-width: 1500px; margin: 0 auto; }
+    main { padding: 18px 24px 28px; max-width: 1500px; margin: 0 auto; height: calc(100vh - 65px); display: flex; flex-direction: column; min-height: 0; }
     .stats { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
     .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
     .stat strong { display: block; font-size: 20px; }
@@ -590,8 +593,9 @@ const INDEX_HTML = `<!doctype html>
     .status { margin: 6px 0 12px; color: var(--muted); font-size: 13px; }
     .status.error { color: var(--danger); }
     .muted { color: var(--muted); font-size: 12px; }
-    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 14px; align-items: start; }
-    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 14px; align-items: stretch; min-height: 0; flex: 1; }
+    .table-scroll { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); }
     th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; }
     th { color: var(--muted); background: #f1f5f9; font-size: 12px; position: sticky; top: 0; z-index: 1; }
     tr { cursor: pointer; }
@@ -599,7 +603,7 @@ const INDEX_HTML = `<!doctype html>
     td.time { white-space: nowrap; font-variant-numeric: tabular-nums; }
     td.ip, td.user, td.op { overflow-wrap: anywhere; }
     .chip { display: inline-flex; align-items: center; min-height: 23px; padding: 2px 8px; border-radius: 999px; background: var(--chip); color: #28505a; font-size: 12px; font-weight: 650; }
-    aside { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-height: 360px; position: sticky; top: 12px; }
+    aside { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-height: 0; overflow: auto; }
     aside h2 { margin: 0; padding: 13px 14px; font-size: 15px; }
     .detail-head { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
     .icon-button { width: 32px; height: 32px; margin-right: 8px; padding: 0; border-radius: 7px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 22px; line-height: 1; display: none; align-items: center; justify-content: center; }
@@ -623,9 +627,11 @@ const INDEX_HTML = `<!doctype html>
     .watch-title h3 { margin: 0; font-size: 13px; }
     .watch-title span { color: var(--muted); font-size: 11px; }
     .watch-list { display: grid; gap: 8px; }
-    .watch-user { border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: #fbfcfe; }
+    .watch-user { border: 1px solid #9bc59f; border-left: 5px solid #2f8f46; border-radius: 8px; padding: 8px; background: #f1fbf4; }
     .watch-user.elevated { border-color: #d99a2b; background: #fff8eb; }
     .watch-user.high { border-color: var(--danger); background: #fff1f2; }
+    .watch-user.elevated { border-left-color: #d99a2b; }
+    .watch-user.high { border-left-color: var(--danger); }
     .watch-user strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
     .watch-user span { color: var(--muted); display: block; font-size: 12px; margin-top: 3px; }
     pre { margin: 0; padding: 12px; background: #0f172a; color: #dbeafe; border-radius: 8px; overflow: auto; max-height: 520px; font-size: 12px; line-height: 1.45; }
@@ -634,13 +640,16 @@ const INDEX_HTML = `<!doctype html>
     @media (max-width: 1100px) {
       .toolbar { grid-template-columns: 1fr 1fr; }
       .layout { grid-template-columns: 1fr; }
-      aside { position: static; }
+      aside { min-height: 420px; }
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 700px) {
       main, header { padding-left: 12px; padding-right: 12px; }
       .toolbar { grid-template-columns: 1fr; }
+      body { overflow: auto; height: auto; }
+      main { height: auto; }
       .stats { grid-template-columns: 1fr; }
+      .table-scroll { max-height: 65vh; }
       th:nth-child(4), td:nth-child(4), th:nth-child(6), td:nth-child(6), th:nth-child(7), td:nth-child(7) { display: none; }
     }
   </style>
@@ -688,21 +697,23 @@ const INDEX_HTML = `<!doctype html>
     </form>
     <div class="status" id="status"></div>
     <section class="layout">
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>User</th>
-            <th>Event</th>
-            <th>Device</th>
-            <th>IP / Tunnel</th>
-            <th>Gateway</th>
-            <th>Duration</th>
-            <th>Transfer</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>User</th>
+              <th>Event</th>
+              <th>Device</th>
+              <th>IP / Tunnel</th>
+              <th>Gateway</th>
+              <th>Duration</th>
+              <th>Transfer</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
       <aside>
         <div class="detail-head">
           <h2>Event Detail</h2>
@@ -724,6 +735,7 @@ const INDEX_HTML = `<!doctype html>
     const closeDetail = document.querySelector("#closeDetail");
     const IDLE_RELOAD_MS = 30 * 60 * 1000;
     let idleReloadTimer;
+    let loadingPollTimer;
 
     async function getJson(url, options) {
       const res = await fetch(url, options);
@@ -785,10 +797,11 @@ const INDEX_HTML = `<!doctype html>
         stat("Records", data.records),
         stat("Objects", data.objects),
         stat("Active users", data.activeUsers + " users / " + data.activeSessions + " sessions"),
-        stat("Disconnected", (data.byEvent && data.byEvent["client-disconnected"]) || 0),
         stat("Transfer", formatBytes((data.totalBytesIn || 0) + (data.totalBytesOut || 0))),
         '<div class="stat"><strong>' + days.length + '</strong><span>active days</span><div class="bars">' + days.map(([day, count]) => '<div class="bar" title="' + esc(day + ": " + count) + '" style="height:' + Math.max(5, Math.round((count / max) * 34)) + 'px"></div>').join("") + '</div></div>'
       ].join("");
+      scheduleLoadingPoll(data.loading);
+      return data;
     }
 
     function stat(label, value) {
@@ -937,6 +950,14 @@ const INDEX_HTML = `<!doctype html>
       await loadChurnWatch();
       await search();
       resetIdleReloadTimer();
+    }
+
+    function scheduleLoadingPoll(isLoading) {
+      clearTimeout(loadingPollTimer);
+      if (!isLoading) return;
+      loadingPollTimer = setTimeout(() => {
+        boot().catch(showError);
+      }, 5000);
     }
 
     boot().catch(showError);
