@@ -585,11 +585,13 @@ const INDEX_HTML = `<!doctype html>
     .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
     .stat strong { display: block; font-size: 20px; }
     .stat span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 150px 160px 130px 170px 140px 140px 110px auto auto; gap: 8px; align-items: end; margin-bottom: 14px; }
+    .toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 150px 160px 130px 170px 140px 140px 110px 150px; gap: 8px; align-items: end; margin-bottom: 14px; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
     input, select, button { height: 38px; border-radius: 7px; border: 1px solid var(--line); background: white; color: var(--text); padding: 0 10px; font: inherit; min-width: 0; }
     button { background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 700; }
     button.secondary { background: white; color: var(--accent); }
+    .toolbar-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-self: end; }
+    .toolbar-actions button { width: 100%; }
     .status { margin: 6px 0 12px; color: var(--muted); font-size: 13px; }
     .status.error { color: var(--danger); }
     .muted { color: var(--muted); font-size: 12px; }
@@ -692,8 +694,10 @@ const INDEX_HTML = `<!doctype html>
           <option value="10000">10000</option>
         </select>
       </label>
-      <button type="button" class="secondary" id="clearFilters">Clear</button>
-      <button type="button" class="secondary" id="reload">Reload</button>
+      <div class="toolbar-actions" aria-label="Toolbar actions">
+        <button type="button" class="secondary" id="clearFilters">Clear</button>
+        <button type="button" class="secondary" id="reload">Reload</button>
+      </div>
     </form>
     <div class="status" id="status"></div>
     <section class="layout">
