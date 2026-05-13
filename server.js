@@ -331,6 +331,7 @@ function userChurnSummary(userName) {
       total: 0,
       shortSessions: 0,
       totalTransfer: 0,
+      connectedForSeconds: 0,
       windowHours: 24,
       severity: "none",
       message: "No user identity on this event."
@@ -351,6 +352,7 @@ function userChurnSummary(userName) {
   const disconnected = userRecords.filter((record) => record.eventName === "client-disconnected").length;
   const shortSessions = userRecords.filter((record) => record.eventName === "client-disconnected" && record.durationSeconds > 0 && record.durationSeconds <= 60).length;
   const totalTransfer = userRecords.reduce((sum, record) => sum + (record.bytesIn || 0) + (record.bytesOut || 0), 0);
+  const connectedForSeconds = connectedSecondsByUser(newest, cutoff).get(userName) || 0;
   const total = connected + disconnected;
   let severity = "normal";
   if (total >= 100 || shortSessions >= 25) severity = "high";
@@ -377,6 +379,7 @@ function userChurnSummary(userName) {
     total,
     shortSessions,
     totalTransfer,
+    connectedForSeconds,
     windowHours,
     severity,
     message: churnMessage(severity, total, shortSessions, windowHours),
@@ -390,6 +393,7 @@ function churnLeaderboard(limit = 10) {
   const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
   const cutoff = newest - (windowHours * 60 * 60 * 1000);
   const users = new Map();
+  const connectedSeconds = connectedSecondsByUser(newest, cutoff);
 
   for (const record of store.records) {
     if (record.eventName !== "client-connected" && record.eventName !== "client-disconnected") continue;
@@ -417,6 +421,7 @@ function churnLeaderboard(limit = 10) {
 
   const rows = [...users.values()].map((user) => {
     const total = user.connected + user.disconnected;
+    user.connectedForSeconds = connectedSeconds.get(user.userName) || 0;
     let severity = "normal";
     if (total >= 100 || user.shortSessions >= 25) severity = "high";
     else if (total >= 40 || user.shortSessions >= 10) severity = "elevated";
@@ -440,6 +445,41 @@ function churnLeaderboard(limit = 10) {
     excessiveCount: rows.filter((row) => row.severity === "high" || row.severity === "elevated").length,
     users: rows.slice(0, limit)
   };
+}
+
+function connectedSecondsByUser(newest, cutoff) {
+  const sessions = new Map();
+  for (const record of store.records) {
+    if (!record.sessionId || (record.eventName !== "client-connected" && record.eventName !== "client-disconnected")) continue;
+    if (!sessions.has(record.sessionId)) {
+      sessions.set(record.sessionId, {
+        userName: record.userName || record.parentEntityName || record.initiatorName,
+        start: Number.POSITIVE_INFINITY,
+        end: null,
+        latestTimestamp: ""
+      });
+    }
+    const session = sessions.get(record.sessionId);
+    if (!session.userName) session.userName = record.userName || record.parentEntityName || record.initiatorName;
+    const start = Date.parse(record.sessionStartTime || record.timestamp);
+    if (Number.isFinite(start)) session.start = Math.min(session.start, start);
+    if (record.eventName === "client-disconnected") {
+      const end = Date.parse(record.sessionEndTime || record.timestamp);
+      if (Number.isFinite(end)) session.end = Math.max(session.end || 0, end);
+    }
+    if (record.timestamp > session.latestTimestamp) session.latestTimestamp = record.timestamp;
+  }
+
+  const byUser = new Map();
+  for (const session of sessions.values()) {
+    if (!session.userName || !Number.isFinite(session.start)) continue;
+    const end = session.end || newest;
+    const overlapStart = Math.max(session.start, cutoff);
+    const overlapEnd = Math.min(end, newest);
+    const seconds = Math.max(0, Math.floor((overlapEnd - overlapStart) / 1000));
+    byUser.set(session.userName, (byUser.get(session.userName) || 0) + seconds);
+  }
+  return byUser;
 }
 
 function churnMessage(severity, total, shortSessions, windowHours) {
@@ -618,7 +658,7 @@ const INDEX_HTML = `<!doctype html>
     .churn .summary { margin-bottom: 8px; font-size: 13px; color: var(--muted); }
     .churn.elevated { border-color: #d99a2b; background: #fff8eb; }
     .churn.high { border-color: var(--danger); background: #fff1f2; }
-    .mini-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
+    .mini-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
     .mini-stat { border: 1px solid var(--line); border-radius: 7px; padding: 7px; background: white; min-width: 0; }
     .mini-stat strong { display: block; font-size: 16px; }
     .mini-stat span { color: var(--muted); font-size: 11px; }
@@ -780,6 +820,7 @@ const INDEX_HTML = `<!doctype html>
       return rows.map(user => '<div class="watch-user ' + esc(user.severity) + '">' +
         '<strong>' + esc(user.userName) + '</strong>' +
         '<span>' + esc(user.total) + ' events: ' + esc(user.connected) + ' connects, ' + esc(user.disconnected) + ' disconnects, ' + esc(user.shortSessions) + ' short sessions</span>' +
+        '<span>Connected for ' + esc(formatDuration(user.connectedForSeconds)) + '</span>' +
       '</div>').join("");
     }
 
@@ -869,6 +910,7 @@ const INDEX_HTML = `<!doctype html>
           miniStat(churn.connected, "connects") +
           miniStat(churn.disconnected, "disconnects") +
           miniStat(churn.shortSessions, "short sessions") +
+          miniStat(formatDuration(churn.connectedForSeconds), "connected for") +
           miniStat(formatBytes(churn.totalTransfer), "transfer") +
         '</div>' +
         '<div class="mini-list">' + (recent || '<div>No recent connection events for this user.</div>') + '</div>' +
