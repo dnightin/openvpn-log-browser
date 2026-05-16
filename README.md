@@ -31,7 +31,25 @@ PORT=3000
 S3_BUCKET_URL=https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
 LOG_PREFIX=CloudConnexa/wellesley/
 RAW_DIR=data/raw
+AUTO_REFRESH_MINUTES=30
+ACTIVE_SESSION_MAX_AGE_HOURS=72
+
+# Optional MySQL aggregate count storage.
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=openvpn_log_browser
+MYSQL_PASSWORD=<password>
+MYSQL_DATABASE=openvpn_log_browser
 ```
+
+When MySQL is configured, the app stores only aggregate licensing telemetry:
+
+- sample timestamp
+- connected user count
+- excluded reconnect-heavy user count
+
+The `connected_user_counts` table contains only those three columns.
+No usernames, IPs, session IDs, raw logs, or event payloads are written to MySQL. Samples older than 365 days are deleted automatically.
 
 ## S3 Bucket Access
 

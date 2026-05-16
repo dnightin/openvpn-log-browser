@@ -12,6 +12,16 @@ const BUCKET_URL = ensureTrailingSlash(process.env.S3_BUCKET_URL || "https://wc-
 const LOG_PREFIX = process.env.LOG_PREFIX || "CloudConnexa/wellesley/";
 const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
 const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 25));
+const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
+const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 72));
+const MYSQL_ENABLED = Boolean(process.env.MYSQL_HOST || process.env.MYSQL_USER || process.env.MYSQL_DATABASE);
+const MYSQL_CONFIG = {
+  host: process.env.MYSQL_HOST || "127.0.0.1",
+  port: Number(process.env.MYSQL_PORT || 3306),
+  user: process.env.MYSQL_USER || "openvpn_log_browser",
+  password: process.env.MYSQL_PASSWORD || "",
+  database: process.env.MYSQL_DATABASE || "openvpn_log_browser"
+};
 const SECRET_KEY_RE = /(token|secret|password|credential|private.?key|client.?key|refresh|bearer|session)/i;
 
 let store = {
@@ -22,12 +32,31 @@ let store = {
   error: "Loading logs..."
 };
 let refreshPromise = null;
+let mysqlPool = null;
+let mysqlStatus = MYSQL_ENABLED ? "not connected" : "disabled";
 
 function ensureTrailingSlash(value) {
   return value.endsWith("/") ? value : `${value}/`;
 }
 
-function httpGetBuffer(url) {
+async function httpGetBuffer(url, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await httpGetBufferOnce(url);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await delay(500 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function httpGetBufferOnce(url) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https:") ? https : http;
     const req = client.get(url, { timeout: 30000 }, (res) => {
@@ -227,16 +256,27 @@ async function parseObject(compressed, key) {
 async function loadFromS3() {
   const objects = await listBucketObjects();
   const records = [];
+  const failed = [];
   for (let index = 0; index < objects.length; index += FETCH_CONCURRENCY) {
     const batch = objects.slice(index, index + FETCH_CONCURRENCY);
     const batchRecords = await Promise.all(batch.map(async (object) => {
-      const url = BUCKET_URL + object.key.split("/").map(encodeURIComponent).join("/");
-      const compressed = await httpGetBuffer(url);
-      return parseObject(compressed, object.key);
+      try {
+        const url = BUCKET_URL + object.key.split("/").map(encodeURIComponent).join("/");
+        const compressed = await httpGetBuffer(url);
+        return parseObject(compressed, object.key);
+      } catch (error) {
+        failed.push(`${object.key}: ${error.message}`);
+        return [];
+      }
     }));
     for (const objectRecords of batchRecords) records.push(...objectRecords);
   }
-  return { records, objects, source: BUCKET_URL };
+  return {
+    records,
+    objects,
+    source: BUCKET_URL,
+    error: failed.length ? `Skipped ${failed.length} S3 object(s) after retries. First error: ${failed[0]}` : null
+  };
 }
 
 async function loadFromRawDir() {
@@ -255,6 +295,49 @@ async function loadFromRawDir() {
   };
 }
 
+async function initMysql() {
+  if (!MYSQL_ENABLED) return;
+  const mysql = require("mysql2/promise");
+  mysqlPool = mysql.createPool({
+    ...MYSQL_CONFIG,
+    waitForConnections: true,
+    connectionLimit: 4,
+    enableKeepAlive: true,
+    timezone: "Z"
+  });
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS connected_user_counts (
+      sampled_at DATETIME NOT NULL PRIMARY KEY,
+      connected_users INT UNSIGNED NOT NULL,
+      excluded_users INT UNSIGNED NOT NULL
+    )
+  `);
+  mysqlStatus = "connected";
+}
+
+async function saveConnectedCountSample() {
+  if (!mysqlPool || !store.records.length) return;
+  try {
+    const snapshot = connectedUsersSnapshot();
+    const sampledAt = mysqlDate(new Date());
+    await mysqlPool.execute(
+      `INSERT INTO connected_user_counts (sampled_at, connected_users, excluded_users)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE connected_users = VALUES(connected_users), excluded_users = VALUES(excluded_users)`,
+      [sampledAt, snapshot.connectedUsers, snapshot.excludedUsers]
+    );
+    await mysqlPool.execute("DELETE FROM connected_user_counts WHERE sampled_at < UTC_TIMESTAMP() - INTERVAL 365 DAY");
+    mysqlStatus = "connected";
+  } catch (error) {
+    mysqlStatus = `unavailable: ${error.message}`;
+    console.error(error);
+  }
+}
+
+function mysqlDate(date) {
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
 async function refresh() {
   if (refreshPromise) return refreshPromise;
   refreshPromise = refreshNow().finally(() => {
@@ -266,7 +349,9 @@ async function refresh() {
 async function refreshNow() {
   store = { ...store, error: null };
   try {
-    store = { ...await loadFromS3(), loadedAt: new Date().toISOString(), error: null };
+    const loaded = await loadFromS3();
+    store = { ...loaded, loadedAt: new Date().toISOString(), error: loaded.error || null };
+    await saveConnectedCountSample();
   } catch (s3Error) {
     const s3Message = s3Error.message || "access denied or network blocked";
     try {
@@ -276,6 +361,7 @@ async function refreshNow() {
         loadedAt: new Date().toISOString(),
         error: `S3 unavailable (${s3Message}); loaded local cache instead.`
       };
+      await saveConnectedCountSample();
     } catch (localError) {
       store = {
         records: [],
@@ -447,7 +533,26 @@ function churnLeaderboard(limit = 10) {
   };
 }
 
-function connectedSecondsByUser(newest, cutoff) {
+function excessiveReconnectUsers(newest, cutoff) {
+  const users = new Map();
+  for (const record of store.records) {
+    if (record.eventName !== "client-connected" && record.eventName !== "client-disconnected") continue;
+    const ts = Date.parse(record.timestamp);
+    if (!Number.isFinite(ts) || ts < cutoff) continue;
+    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    if (!userName) continue;
+    if (!users.has(userName)) users.set(userName, { total: 0, shortSessions: 0 });
+    const user = users.get(userName);
+    user.total += 1;
+    if (record.eventName === "client-disconnected" && record.durationSeconds > 0 && record.durationSeconds <= 60) user.shortSessions += 1;
+  }
+
+  return new Set([...users.entries()]
+    .filter(([, user]) => user.total >= 40 || user.shortSessions >= 10)
+    .map(([userName]) => userName));
+}
+
+function connectionSessions() {
   const sessions = new Map();
   for (const record of store.records) {
     if (!record.sessionId || (record.eventName !== "client-connected" && record.eventName !== "client-disconnected")) continue;
@@ -469,10 +574,12 @@ function connectedSecondsByUser(newest, cutoff) {
     }
     if (record.timestamp > session.latestTimestamp) session.latestTimestamp = record.timestamp;
   }
+  return [...sessions.values()].filter((session) => session.userName && Number.isFinite(session.start));
+}
 
+function connectedSecondsByUser(newest, cutoff) {
   const byUser = new Map();
-  for (const session of sessions.values()) {
-    if (!session.userName || !Number.isFinite(session.start)) continue;
+  for (const session of connectionSessions()) {
     const end = session.end || newest;
     const overlapStart = Math.max(session.start, cutoff);
     const overlapEnd = Math.min(end, newest);
@@ -480,6 +587,113 @@ function connectedSecondsByUser(newest, cutoff) {
     byUser.set(session.userName, (byUser.get(session.userName) || 0) + seconds);
   }
   return byUser;
+}
+
+function connectedUsersSnapshot() {
+  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
+  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const cutoff = newest - (24 * 60 * 60 * 1000);
+  const staleCutoff = newest - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
+  const excludedUsers = excessiveReconnectUsers(newest, cutoff);
+  const activeUsers = new Set();
+  for (const session of connectionSessions()) {
+    if (excludedUsers.has(session.userName)) continue;
+    if (!session.end && session.start < staleCutoff) continue;
+    const end = session.end || newest + 1;
+    if (session.start <= newest && end > newest) activeUsers.add(session.userName);
+  }
+  return {
+    connectedUsers: activeUsers.size,
+    excludedUsers: excludedUsers.size,
+    generatedAt: new Date(newest).toISOString()
+  };
+}
+
+async function connectedUsersSeries(range = "week") {
+  const normalizedRange = ["week", "month", "year"].includes(range) ? range : "week";
+  if (mysqlPool) {
+    try {
+      return await connectedUsersSeriesFromMysql(normalizedRange);
+    } catch (error) {
+      mysqlStatus = `unavailable: ${error.message}`;
+      console.error(error);
+    }
+  }
+  return inMemoryConnectedUsersSeries(normalizedRange);
+}
+
+async function connectedUsersSeriesFromMysql(range) {
+  const daysByRange = { week: 7, month: 31, year: 365 };
+  const [rows] = await mysqlPool.execute(
+    `SELECT sampled_at, connected_users, excluded_users
+     FROM connected_user_counts
+     WHERE sampled_at >= UTC_TIMESTAMP() - INTERVAL ? DAY
+     ORDER BY sampled_at`,
+    [daysByRange[range]]
+  );
+  return {
+    range,
+    source: "mysql",
+    retentionDays: 365,
+    mysqlStatus,
+    points: rows.map((row) => ({
+      timestamp: new Date(row.sampled_at).toISOString(),
+      connectedUsers: Number(row.connected_users),
+      excludedUsers: Number(row.excluded_users)
+    }))
+  };
+}
+
+function inMemoryConnectedUsersSeries(range = "week") {
+  const rangeConfig = {
+    week: { windowHours: 24 * 7, stepMinutes: 120 },
+    month: { windowHours: 24 * 31, stepMinutes: 720 },
+    year: { windowHours: 24 * 365, stepMinutes: 1440 }
+  }[range] || { windowHours: 24 * 7, stepMinutes: 120 };
+  const { windowHours, stepMinutes } = rangeConfig;
+  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
+  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const start = newest - (windowHours * 60 * 60 * 1000);
+  const stepMs = stepMinutes * 60 * 1000;
+  const excludedUsers = excessiveReconnectUsers(newest, newest - (24 * 60 * 60 * 1000));
+  const sessions = connectionSessions().filter((session) => !excludedUsers.has(session.userName));
+  const points = [];
+
+  for (let time = start; time <= newest; time += stepMs) {
+    const activeUsers = new Set();
+    for (const session of sessions) {
+      if (!session.end && session.start < time - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000)) continue;
+      const end = session.end || newest + 1;
+      if (session.start <= time && end > time) activeUsers.add(session.userName);
+    }
+    points.push({
+      timestamp: new Date(time).toISOString(),
+      connectedUsers: activeUsers.size
+    });
+  }
+
+  if (!points.length || points[points.length - 1].timestamp !== new Date(newest).toISOString()) {
+    const activeUsers = new Set();
+    for (const session of sessions) {
+      if (!session.end && session.start < newest - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000)) continue;
+      const end = session.end || newest + 1;
+      if (session.start <= newest && end > newest) activeUsers.add(session.userName);
+    }
+    points.push({
+      timestamp: new Date(newest).toISOString(),
+      connectedUsers: activeUsers.size
+    });
+  }
+
+  return {
+    range,
+    source: "memory",
+    windowHours,
+    stepMinutes,
+    excludedUsers: excludedUsers.size,
+    generatedAt: new Date(newest).toISOString(),
+    points
+  };
 }
 
 function churnMessage(severity, total, shortSessions, windowHours) {
@@ -505,7 +719,6 @@ function stats() {
   const timestamps = store.records.map((record) => record.timestamp).filter(Boolean).sort();
   const byDay = {};
   const byEvent = {};
-  const sessionLatest = new Map();
   let totalBytesIn = 0;
   let totalBytesOut = 0;
   for (const record of store.records) {
@@ -514,20 +727,22 @@ function stats() {
     if (record.eventName) byEvent[record.eventName] = (byEvent[record.eventName] || 0) + 1;
     totalBytesIn += record.bytesIn || 0;
     totalBytesOut += record.bytesOut || 0;
-    if (record.sessionId) {
-      const current = sessionLatest.get(record.sessionId);
-      if (!current || record.timestamp > current.timestamp) sessionLatest.set(record.sessionId, record);
-    }
   }
-  const activeSessions = [...sessionLatest.values()].filter((record) => record.eventName === "client-connected").length;
-  const activeUsers = unique([...sessionLatest.values()]
-    .filter((record) => record.eventName === "client-connected")
-    .map((record) => record.userName || record.parentEntityName || record.initiatorName)).length;
+  const newest = timestamps.length ? Date.parse(timestamps[timestamps.length - 1]) : Date.now();
+  const staleCutoff = newest - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
+  const activeSessionRows = connectionSessions().filter((session) => {
+    if (!session.end && session.start < staleCutoff) return false;
+    const end = session.end || newest + 1;
+    return session.start <= newest && end > newest;
+  });
+  const activeSessions = activeSessionRows.length;
+  const activeUsers = unique(activeSessionRows.map((session) => session.userName)).length;
   return {
     records: store.records.length,
     objects: store.objects.length,
     activeSessions,
     activeUsers,
+    mysql: mysqlStatus,
     byEvent,
     totalBytesIn,
     totalBytesOut,
@@ -569,6 +784,7 @@ async function handler(req, res) {
       const limit = Math.min(Number(url.searchParams.get("limit") || 10), 50);
       return json(res, churnLeaderboard(limit));
     }
+    if (url.pathname === "/api/connected-users") return json(res, await connectedUsersSeries(url.searchParams.get("range") || "week"));
     if (url.pathname === "/api/search") {
       const result = filterRecords(url.searchParams);
       return json(res, {
@@ -621,10 +837,23 @@ const INDEX_HTML = `<!doctype html>
     header h1 { margin: 0; font-size: 22px; font-weight: 720; letter-spacing: 0; }
     header .sub { margin-top: 4px; color: #cbd5e1; font-size: 13px; }
     main { padding: 18px 24px 28px; max-width: 1500px; margin: 0 auto; height: calc(100vh - 65px); display: flex; flex-direction: column; min-height: 0; }
-    .stats { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .dashboard-top { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 10px; margin-bottom: 14px; align-items: stretch; }
+    .stats { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 10px; min-width: 0; }
     .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
     .stat strong { display: block; font-size: 20px; }
     .stat span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .chart-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 126px; min-width: 0; }
+    .chart-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; margin-bottom: 5px; }
+    .chart-head h2 { margin: 0; font-size: 13px; line-height: 1.25; }
+    .chart-head span { color: var(--muted); font-size: 11px; display: block; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chart-controls { display: grid; justify-items: end; gap: 3px; min-width: 0; }
+    .chart-controls select { height: 28px; padding: 0 7px; font-size: 12px; }
+    .chart { width: 100%; height: 82px; display: block; }
+    .chart-grid { stroke: #e5e9f0; stroke-width: 1; }
+    .chart-line { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+    .chart-area { fill: rgba(22, 108, 125, .12); }
+    .chart-dot { fill: var(--accent); }
+    .chart-label { fill: var(--muted); font-size: 11px; }
     .toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 150px 160px 130px 170px 140px 140px 110px 150px; gap: 8px; align-items: end; margin-bottom: 14px; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
     input, select, button { height: 38px; border-radius: 7px; border: 1px solid var(--line); background: white; color: var(--text); padding: 0 10px; font: inherit; min-width: 0; }
@@ -683,6 +912,7 @@ const INDEX_HTML = `<!doctype html>
       .toolbar { grid-template-columns: 1fr 1fr; }
       .layout { grid-template-columns: 1fr; }
       aside { min-height: 420px; }
+      .dashboard-top { grid-template-columns: 1fr; }
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 700px) {
@@ -691,6 +921,8 @@ const INDEX_HTML = `<!doctype html>
       body { overflow: auto; height: auto; }
       main { height: auto; }
       .stats { grid-template-columns: 1fr; }
+      .chart-head { grid-template-columns: 1fr; }
+      .chart-controls { justify-items: start; }
       .table-scroll { max-height: 65vh; }
       th:nth-child(4), td:nth-child(4), th:nth-child(6), td:nth-child(6), th:nth-child(7), td:nth-child(7) { display: none; }
     }
@@ -702,7 +934,23 @@ const INDEX_HTML = `<!doctype html>
     <div class="sub" id="sourceLine">Loading authorized CloudConnexa audit logs...</div>
   </header>
   <main>
-    <section class="stats" id="stats"></section>
+    <section class="dashboard-top">
+      <div class="stats" id="stats"></div>
+      <aside class="chart-panel">
+        <div class="chart-head">
+          <h2>Connected Users Over Time</h2>
+          <div class="chart-controls">
+            <select id="connectedRange" aria-label="Connected users time range">
+              <option value="week">Week</option>
+              <option value="month">Month</option>
+              <option value="year">Year</option>
+            </select>
+            <span id="connectedChartMeta">Loading...</span>
+          </div>
+        </div>
+        <div id="connectedChart"></div>
+      </aside>
+    </section>
     <form class="toolbar" id="filters">
       <label>Search
         <input name="q" autocomplete="off" placeholder="user, IP, operation, device, trace id">
@@ -775,6 +1023,9 @@ const INDEX_HTML = `<!doctype html>
     const details = document.querySelector("#details");
     const churnWatch = document.querySelector("#churnWatch");
     const statsEl = document.querySelector("#stats");
+    const connectedChart = document.querySelector("#connectedChart");
+    const connectedChartMeta = document.querySelector("#connectedChartMeta");
+    const connectedRange = document.querySelector("#connectedRange");
     const sourceLine = document.querySelector("#sourceLine");
     const closeDetail = document.querySelector("#closeDetail");
     const IDLE_RELOAD_MS = 30 * 60 * 1000;
@@ -822,6 +1073,60 @@ const INDEX_HTML = `<!doctype html>
         '<span>' + esc(user.total) + ' events: ' + esc(user.connected) + ' connects, ' + esc(user.disconnected) + ' disconnects, ' + esc(user.shortSessions) + ' short sessions</span>' +
         '<span>Connected for ' + esc(formatDuration(user.connectedForSeconds)) + '</span>' +
       '</div>').join("");
+    }
+
+    async function loadConnectedChart() {
+      const data = await getJson("/api/connected-users?range=" + encodeURIComponent(connectedRange.value));
+      renderConnectedChart(data);
+    }
+
+    function renderConnectedChart(data) {
+      const points = data.points || [];
+      connectedChartMeta.textContent = points.length
+        ? (data.source === "mysql" ? "MySQL, " : "live, ") + "excluding " + (data.excludedUsers ?? latestExcluded(points)) + " reconnect-heavy users"
+        : "No connection data loaded";
+      if (!points.length) {
+        connectedChart.innerHTML = '<div class="muted">Loading connection trend...</div>';
+        return;
+      }
+
+      const width = 340;
+      const height = 82;
+      const pad = { top: 8, right: 8, bottom: 18, left: 26 };
+      const max = Math.max(1, ...points.map(point => point.connectedUsers));
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const x = index => pad.left + (points.length === 1 ? 0 : (index / (points.length - 1)) * plotW);
+      const y = value => pad.top + plotH - (value / max) * plotH;
+      const line = points.map((point, index) => x(index).toFixed(1) + "," + y(point.connectedUsers).toFixed(1)).join(" ");
+      const area = pad.left + "," + (pad.top + plotH) + " " + line + " " + (pad.left + plotW) + "," + (pad.top + plotH);
+      const last = points[points.length - 1];
+      const grid = [0, .5, 1].map(part => {
+        const gy = pad.top + plotH - part * plotH;
+        const label = Math.round(max * part);
+        return '<line class="chart-grid" x1="' + pad.left + '" y1="' + gy + '" x2="' + (pad.left + plotW) + '" y2="' + gy + '"></line>' +
+          '<text class="chart-label" x="4" y="' + (gy + 4) + '">' + esc(label) + '</text>';
+      }).join("");
+      connectedChart.innerHTML = '<svg class="chart" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="Connected users over time">' +
+        grid +
+        '<polygon class="chart-area" points="' + area + '"></polygon>' +
+        '<polyline class="chart-line" points="' + line + '"></polyline>' +
+        '<circle class="chart-dot" cx="' + x(points.length - 1).toFixed(1) + '" cy="' + y(last.connectedUsers).toFixed(1) + '" r="3"></circle>' +
+        '<text class="chart-label" x="' + pad.left + '" y="' + (height - 6) + '">' + esc(shortTime(points[0].timestamp)) + '</text>' +
+        '<text class="chart-label" text-anchor="end" x="' + (pad.left + plotW) + '" y="' + (height - 6) + '">' + esc(shortTime(last.timestamp)) + '</text>' +
+        '<text class="chart-label" text-anchor="end" x="' + (pad.left + plotW - 8) + '" y="' + Math.max(16, y(last.connectedUsers) - 8) + '">' + esc(last.connectedUsers) + ' users</text>' +
+      '</svg>';
+    }
+
+    function latestExcluded(points) {
+      const last = points[points.length - 1];
+      return last && Number.isFinite(Number(last.excludedUsers)) ? Number(last.excludedUsers) : 0;
+    }
+
+    function shortTime(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
     }
 
     function fill(name, values) {
@@ -984,6 +1289,7 @@ const INDEX_HTML = `<!doctype html>
       filters.reset();
       search().catch(showError);
     });
+    connectedRange.addEventListener("change", () => loadConnectedChart().catch(showError));
 
     function showError(error) {
       statusEl.textContent = error.message;
@@ -994,6 +1300,7 @@ const INDEX_HTML = `<!doctype html>
       await loadStats();
       await loadFacets();
       await loadChurnWatch();
+      await loadConnectedChart();
       await search();
       resetIdleReloadTimer();
     }
@@ -1021,9 +1328,20 @@ if (process.argv.includes("--ingest")) {
 } else {
   http.createServer(handler).listen(PORT, () => {
     console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
-    refresh().catch((error) => {
+    initMysql().catch((error) => {
+      mysqlStatus = `unavailable: ${error.message}`;
+      console.error(error);
+    }).finally(() => refresh().catch((error) => {
       store = { ...store, error: error.message };
       console.error(error);
-    });
+    }));
+    if (AUTO_REFRESH_MINUTES > 0) {
+      setInterval(() => {
+        refresh().catch((error) => {
+          store = { ...store, error: error.message };
+          console.error(error);
+        });
+      }, AUTO_REFRESH_MINUTES * 60 * 1000);
+    }
   });
 }
