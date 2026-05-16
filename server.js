@@ -715,15 +715,17 @@ function redact(value, key = "") {
   return value;
 }
 
-function stats() {
+function stats(timeZone = "UTC") {
+  const displayTimeZone = normalizeTimeZone(timeZone);
   const timestamps = store.records.map((record) => record.timestamp).filter(Boolean).sort();
   const byDay = {};
   const byEvent = {};
   let totalBytesIn = 0;
   let totalBytesOut = 0;
   for (const record of store.records) {
-    if (!record.date) continue;
-    byDay[record.date] = (byDay[record.date] || 0) + 1;
+    const day = dayInTimeZone(record.timestamp, displayTimeZone);
+    if (!day) continue;
+    byDay[day] = (byDay[day] || 0) + 1;
     if (record.eventName) byEvent[record.eventName] = (byEvent[record.eventName] || 0) + 1;
     totalBytesIn += record.bytesIn || 0;
     totalBytesOut += record.bytesOut || 0;
@@ -752,8 +754,31 @@ function stats() {
     loading: Boolean(refreshPromise),
     firstTimestamp: timestamps[0] || "",
     lastTimestamp: timestamps[timestamps.length - 1] || "",
+    timeZone: displayTimeZone,
     byDay
   };
+}
+
+function normalizeTimeZone(timeZone) {
+  try {
+    Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
+    return timeZone;
+  } catch {
+    return "UTC";
+  }
+}
+
+function dayInTimeZone(value, timeZone) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
 }
 
 function json(res, data, status = 200) {
@@ -778,7 +803,7 @@ async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (url.pathname === "/") return html(res);
-    if (url.pathname === "/api/stats") return json(res, stats());
+    if (url.pathname === "/api/stats") return json(res, stats(url.searchParams.get("timeZone") || "UTC"));
     if (url.pathname === "/api/facets") return json(res, facets());
     if (url.pathname === "/api/churn") {
       const limit = Math.min(Number(url.searchParams.get("limit") || 10), 50);
@@ -842,6 +867,9 @@ const INDEX_HTML = `<!doctype html>
     .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
     .stat strong { display: block; font-size: 20px; }
     .stat span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .stat-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .stat-head strong { display: inline; }
+    .stat select { height: 28px; padding: 0 7px; font-size: 12px; max-width: 145px; }
     .chart-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 126px; min-width: 0; }
     .chart-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; margin-bottom: 5px; }
     .chart-head h2 { margin: 0; font-size: 13px; line-height: 1.25; }
@@ -1029,6 +1057,20 @@ const INDEX_HTML = `<!doctype html>
     const sourceLine = document.querySelector("#sourceLine");
     const closeDetail = document.querySelector("#closeDetail");
     const IDLE_RELOAD_MS = 30 * 60 * 1000;
+    const TIME_ZONE_STORAGE_KEY = "openvpnLogBrowserTimeZone";
+    const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const timeZones = Array.from(new Set([
+      localTimeZone,
+      "UTC",
+      "America/New_York",
+      "America/Chicago",
+      "America/Denver",
+      "America/Los_Angeles",
+      "Europe/London"
+    ]));
+    let selectedTimeZone = validTimeZone(localStorage.getItem(TIME_ZONE_STORAGE_KEY) || localTimeZone);
+    if (!timeZones.includes(selectedTimeZone)) timeZones.unshift(selectedTimeZone);
+    let selectedRecordId = "";
     let idleReloadTimer;
     let loadingPollTimer;
 
@@ -1126,7 +1168,32 @@ const INDEX_HTML = `<!doctype html>
     function shortTime(value) {
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+      return date.toLocaleString([], { timeZone: selectedTimeZone, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    }
+
+    function displayTime(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value || "";
+      return date.toLocaleString([], {
+        timeZone: selectedTimeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+        timeZoneName: "short"
+      });
+    }
+
+    function validTimeZone(zone) {
+      try {
+        Intl.DateTimeFormat([], { timeZone: zone }).format(new Date());
+        return zone;
+      } catch {
+        return localTimeZone;
+      }
     }
 
     function fill(name, values) {
@@ -1137,19 +1204,17 @@ const INDEX_HTML = `<!doctype html>
     }
 
     async function loadStats() {
-      const data = await getJson("/api/stats");
-      sourceLine.textContent = data.source + " | loaded " + (data.loadedAt || "never");
+      const data = await getJson("/api/stats?timeZone=" + encodeURIComponent(selectedTimeZone));
+      sourceLine.textContent = data.source + " | loaded " + (data.loadedAt ? displayTime(data.loadedAt) : "never");
       statusEl.textContent = data.loading ? "Loading logs..." : (data.error || "");
       statusEl.className = data.error ? "status error" : "status";
       const days = Object.entries(data.byDay || {});
       const max = Math.max(1, ...days.map(([, count]) => count));
       statsEl.innerHTML = [
-        stat("Records", data.records),
-        stat("Objects", data.objects),
         stat("Active users", data.activeUsers + " users / " + data.activeSessions + " sessions"),
-        stat("Transfer", formatBytes((data.totalBytesIn || 0) + (data.totalBytesOut || 0))),
-        '<div class="stat"><strong>' + days.length + '</strong><span>active days</span><div class="bars">' + days.map(([day, count]) => '<div class="bar" title="' + esc(day + ": " + count) + '" style="height:' + Math.max(5, Math.round((count / max) * 34)) + 'px"></div>').join("") + '</div></div>'
+        '<div class="stat"><div class="stat-head"><strong>' + days.length + '</strong>' + timeZoneSelect() + '</div><span>active days</span><div class="bars">' + days.map(([day, count]) => '<div class="bar" title="' + esc(day + ": " + count) + '" style="height:' + Math.max(5, Math.round((count / max) * 34)) + 'px"></div>').join("") + '</div></div>'
       ].join("");
+      bindTimeZoneSelect();
       scheduleLoadingPoll(data.loading);
       return data;
     }
@@ -1158,11 +1223,34 @@ const INDEX_HTML = `<!doctype html>
       return '<div class="stat"><strong>' + esc(value) + '</strong><span>' + esc(label) + '</span></div>';
     }
 
+    function timeZoneSelect() {
+      return '<select id="timeZone" aria-label="Display timezone">' + timeZones.map(zone =>
+        '<option value="' + esc(zone) + '"' + (zone === selectedTimeZone ? " selected" : "") + '>' + esc(zoneLabel(zone)) + '</option>'
+      ).join("") + '</select>';
+    }
+
+    function zoneLabel(zone) {
+      return zone === localTimeZone ? "Local (" + zone + ")" : zone;
+    }
+
+    function bindTimeZoneSelect() {
+      const select = document.querySelector("#timeZone");
+      if (!select) return;
+      select.addEventListener("change", () => {
+        selectedTimeZone = validTimeZone(select.value);
+        localStorage.setItem(TIME_ZONE_STORAGE_KEY, selectedTimeZone);
+        loadStats().catch(showError);
+        loadConnectedChart().catch(showError);
+        search().catch(showError);
+        if (selectedRecordId) selectRecord(selectedRecordId).catch(showError);
+      });
+    }
+
     async function search() {
       const data = await getJson("/api/search?" + params());
       statusEl.textContent = (statusEl.className.includes("error") ? statusEl.textContent + " | " : "") + "searched " + data.searched + " loaded events; " + data.total + " matched; showing " + data.rows.length + " of " + data.limit;
       rows.innerHTML = data.rows.map(record => '<tr data-id="' + esc(record.id) + '">' +
-        '<td class="time">' + esc(record.timestamp.replace("T", " ").replace("Z", "")) + '</td>' +
+        '<td class="time">' + esc(displayTime(record.timestamp)) + '</td>' +
         '<td class="user">' + esc(record.userName || record.initiatorName) + '</td>' +
         '<td><span class="chip">' + esc(record.eventName || record.operation || "event") + '</span></td>' +
         '<td>' + esc(record.deviceName || record.entityName) + '<br><span class="muted">' + esc(record.os) + '</span></td>' +
@@ -1174,10 +1262,11 @@ const INDEX_HTML = `<!doctype html>
     }
 
     async function selectRecord(id) {
+      selectedRecordId = id;
       const record = await getJson("/api/record?id=" + encodeURIComponent(id));
       closeDetail.style.display = "inline-flex";
       details.innerHTML = '<div class="kv">' +
-        kv("Timestamp", record.timestamp) +
+        kv("Timestamp", displayTime(record.timestamp)) +
         kv("Event", record.eventName || record.operation) +
         kv("User", record.userName || record.initiatorName) +
         kv("Device", record.deviceName || record.entityName) +
@@ -1202,7 +1291,7 @@ const INDEX_HTML = `<!doctype html>
     function churnPanel(churn) {
       if (!churn) return "";
       const recent = (churn.latest || []).map(item => '<div>' +
-        esc(item.timestamp.replace("T", " ").replace("Z", "")) + " | " +
+        esc(displayTime(item.timestamp)) + " | " +
         esc(item.eventName) + " | " +
         esc(item.deviceName || "-") + " | " +
         esc(item.publicIp || "-") +
@@ -1227,6 +1316,7 @@ const INDEX_HTML = `<!doctype html>
     }
 
     closeDetail.addEventListener("click", () => {
+      selectedRecordId = "";
       closeDetail.style.display = "none";
       details.textContent = "Select a log event.";
     });
