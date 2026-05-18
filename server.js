@@ -1075,10 +1075,10 @@ const INDEX_HTML = `<!doctype html>
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; height: 100dvh; overflow: hidden; }
-    header { background: #111827; color: white; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+    header { background: #111827; color: white; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
     .brand { min-width: 0; }
-    header h1 { margin: 0; font-size: 22px; font-weight: 720; letter-spacing: 0; }
-    header .sub { margin-top: 4px; color: #cbd5e1; font-size: 13px; }
+    header h1 { margin: 0; font-size: 20px; font-weight: 720; letter-spacing: 0; }
+    header .sub { margin-top: 3px; color: #cbd5e1; font-size: 12px; }
     .account { position: relative; flex: 0 0 auto; }
     .menu-button { background: transparent; border-color: #374151; color: white; display: inline-flex; align-items: center; gap: 8px; }
     .menu-button:hover { background: #1f2937; }
@@ -1087,32 +1087,32 @@ const INDEX_HTML = `<!doctype html>
     .account-menu button, .account-menu a { height: 34px; border: 0; background: white; color: var(--text); border-radius: 6px; padding: 0 9px; text-align: left; text-decoration: none; display: flex; align-items: center; font-weight: 650; }
     .account-menu button:hover, .account-menu a:hover { background: #f1f5f9; }
     .account-name { padding: 7px 9px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    main { padding: 18px 24px 28px; max-width: 1500px; margin: 0 auto; height: calc(100vh - 65px); height: calc(100dvh - 65px); display: flex; flex-direction: column; min-height: 0; width: 100%; }
-    .dashboard-top { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(280px, 340px); gap: 10px; margin-bottom: 14px; align-items: stretch; flex: 0 0 auto; }
-    .stats { display: grid; grid-template-columns: repeat(2, minmax(150px, 1fr)); gap: 10px; min-width: 0; }
-    .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
-    .stat strong { display: block; font-size: 20px; }
+    main { padding: 12px 24px 22px; max-width: 1500px; margin: 0 auto; height: calc(100vh - 57px); height: calc(100dvh - 57px); display: flex; flex-direction: column; min-height: 0; width: 100%; }
+    .dashboard-top { display: grid; grid-template-columns: minmax(160px, 210px) minmax(340px, 1fr) minmax(260px, 320px); gap: 10px; margin-bottom: 10px; align-items: stretch; flex: 0 0 auto; }
+    .stats { display: grid; grid-template-columns: 1fr; gap: 10px; min-width: 0; }
+    .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; min-height: 104px; }
+    .stat strong { display: block; font-size: 19px; line-height: 1.25; }
     .stat span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .chart-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 126px; min-width: 0; }
+    .chart-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; min-height: 104px; min-width: 0; overflow: hidden; }
     .chart-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; margin-bottom: 5px; }
     .chart-head h2 { margin: 0; font-size: 13px; line-height: 1.25; }
     .chart-head span { color: var(--muted); font-size: 11px; display: block; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .chart-controls { display: grid; justify-items: end; gap: 3px; min-width: 0; }
     .chart-controls select { height: 28px; padding: 0 7px; font-size: 12px; }
-    .chart { width: 100%; height: 82px; display: block; }
+    .chart { width: 100%; height: 76px; display: block; }
     .chart-grid { stroke: #e5e9f0; stroke-width: 1; }
     .chart-line { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
     .chart-area { fill: rgba(22, 108, 125, .12); }
     .chart-dot { fill: var(--accent); }
     .chart-label { fill: var(--muted); font-size: 11px; }
-    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(120px, 150px) minmax(130px, 160px) minmax(110px, 130px) minmax(140px, 170px) minmax(110px, 140px) minmax(110px, 140px) 96px 150px; gap: 8px; align-items: end; margin-bottom: 14px; flex: 0 0 auto; }
-    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
-    input, select, button { height: 38px; border-radius: 7px; border: 1px solid var(--line); background: white; color: var(--text); padding: 0 10px; font: inherit; min-width: 0; }
+    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(120px, 150px) minmax(130px, 160px) minmax(110px, 130px) minmax(140px, 170px) minmax(110px, 140px) minmax(110px, 140px) 90px 140px; gap: 8px; align-items: end; margin-bottom: 8px; flex: 0 0 auto; }
+    label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; font-weight: 650; }
+    input, select, button { height: 34px; border-radius: 7px; border: 1px solid var(--line); background: white; color: var(--text); padding: 0 10px; font: inherit; min-width: 0; }
     button { background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 700; }
     button.secondary { background: white; color: var(--accent); }
     .toolbar-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-self: end; }
     .toolbar-actions button { width: 100%; }
-    .status { margin: 6px 0 12px; color: var(--muted); font-size: 13px; min-height: 18px; flex: 0 0 auto; }
+    .status { margin: 4px 0 8px; color: var(--muted); font-size: 12px; min-height: 16px; flex: 0 0 auto; }
     .status.error { color: var(--danger); }
     .muted { color: var(--muted); font-size: 12px; }
     dialog { border: 1px solid var(--line); border-radius: 8px; padding: 0; width: min(760px, calc(100vw - 24px)); max-height: calc(100vh - 40px); box-shadow: 0 24px 80px rgba(15, 23, 42, .24); }
@@ -1126,10 +1126,11 @@ const INDEX_HTML = `<!doctype html>
     .check-row { display: flex; align-items: center; gap: 8px; min-height: 38px; color: var(--text); }
     .check-row input { height: auto; }
     .settings-actions { display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
-    .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 420px); gap: 14px; align-items: stretch; min-height: 0; flex: 1 1 auto; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; align-items: stretch; min-height: 0; flex: 1 1 auto; }
+    .layout.detail-open { grid-template-columns: minmax(0, 1fr) minmax(320px, 380px); }
     .table-scroll { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); contain: size layout paint; }
     table { width: max-content; min-width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--panel); }
-    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+    th, td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
     th { color: var(--muted); background: #f1f5f9; font-size: 12px; position: sticky; top: 0; z-index: 1; user-select: none; }
     th .th-label { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 9px; }
     .col-resizer { position: absolute; top: 0; right: -3px; width: 7px; height: 100%; cursor: col-resize; touch-action: none; z-index: 2; }
@@ -1138,11 +1139,13 @@ const INDEX_HTML = `<!doctype html>
     body.resizing-columns { cursor: col-resize; user-select: none; }
     tr { cursor: pointer; }
     tr:hover td { background: #f8fbfc; }
+    tr.selected td { background: #eef8fb; }
     td.time { white-space: nowrap; font-variant-numeric: tabular-nums; }
     td.ip, td.user, td.op { overflow-wrap: anywhere; }
     td.wrap { white-space: normal; overflow-wrap: anywhere; }
     .chip { display: inline-flex; align-items: center; min-height: 23px; padding: 2px 8px; border-radius: 999px; background: var(--chip); color: #28505a; font-size: 12px; font-weight: 650; }
     aside { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-height: 0; overflow: auto; }
+    .detail-panel[hidden] { display: none; }
     aside h2 { margin: 0; padding: 13px 14px; font-size: 15px; }
     .detail-head { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
     .icon-button { width: 32px; height: 32px; margin-right: 8px; padding: 0; border-radius: 7px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 22px; line-height: 1; display: none; align-items: center; justify-content: center; }
@@ -1161,27 +1164,30 @@ const INDEX_HTML = `<!doctype html>
     .mini-stat span { color: var(--muted); font-size: 11px; }
     .mini-list { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
     .mini-list div { overflow-wrap: anywhere; }
-    .watch { border-bottom: 1px solid var(--line); padding: 12px 14px; }
-    .watch-title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+    .watch { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; min-height: 104px; min-width: 0; overflow: hidden; }
+    .watch-title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
     .watch-title h3 { margin: 0; font-size: 13px; }
     .watch-title span { color: var(--muted); font-size: 11px; }
-    .watch-list { display: grid; gap: 8px; }
-    .watch-user { border: 1px solid #9bc59f; border-left: 5px solid #2f8f46; border-radius: 8px; padding: 8px; background: #f1fbf4; }
-    .watch-user.elevated { border-color: #d99a2b; background: #fff8eb; }
-    .watch-user.high { border-color: var(--danger); background: #fff1f2; }
+    .watch-list { display: grid; gap: 4px; }
+    .watch-user { border: 1px solid #dce7df; border-left: 5px solid #2f8f46; border-radius: 7px; padding: 4px 7px; background: white; display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 24px; }
+    .watch-user.elevated { border-color: #ead3a8; background: white; }
+    .watch-user.high { border-color: #efc7cc; background: white; }
     .watch-user.elevated { border-left-color: #d99a2b; }
     .watch-user.high { border-left-color: var(--danger); }
-    .watch-user strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
-    .watch-user span { color: var(--muted); display: block; font-size: 12px; margin-top: 3px; }
+    .watch-user-link { display: block; height: auto; min-width: 0; padding: 0; border: 0; border-radius: 0; background: transparent; color: var(--text); font-size: 12px; font-weight: 700; line-height: 1.25; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+    .watch-user-link:hover { color: var(--accent); text-decoration: underline; }
+    .watch-user-link:focus-visible { outline: 2px solid rgba(22, 108, 125, .35); outline-offset: 2px; }
+    .watch-user span { color: var(--muted); display: block; font-size: 11px; white-space: nowrap; }
+    .watch-more { color: var(--muted); font-size: 11px; padding: 1px 2px 0 7px; }
     pre { margin: 0; padding: 12px; background: #0f172a; color: #dbeafe; border-radius: 8px; overflow: auto; max-height: 520px; font-size: 12px; line-height: 1.45; }
-    .bars { display: flex; gap: 2px; align-items: end; height: 34px; margin-top: 8px; }
-    .bar { background: var(--accent-2); min-width: 3px; flex: 1; border-radius: 2px 2px 0 0; opacity: .8; }
     @media (max-width: 1100px) {
       .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 820px) {
+      .dashboard-top { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: 1fr; }
       .layout { grid-template-columns: 1fr; }
       aside { min-height: 420px; }
-      .dashboard-top { grid-template-columns: 1fr; }
-      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 700px) {
       main, header { padding-left: 12px; padding-right: 12px; }
@@ -1228,6 +1234,10 @@ const INDEX_HTML = `<!doctype html>
         </div>
         <div id="connectedChart"></div>
       </aside>
+      <section class="watch" id="churnWatch">
+        <div class="watch-title"><h3>Reconnect Watch</h3><span>last 24h</span></div>
+        <div class="watch-list"><div class="muted">Loading reconnect activity...</div></div>
+      </section>
     </section>
     <form class="toolbar" id="filters">
       <label>Search
@@ -1266,7 +1276,7 @@ const INDEX_HTML = `<!doctype html>
       </div>
     </form>
     <div class="status" id="status"></div>
-    <section class="layout">
+    <section class="layout" id="layout">
       <div class="table-scroll">
         <table id="eventsTable">
           <colgroup>
@@ -1294,12 +1304,11 @@ const INDEX_HTML = `<!doctype html>
           <tbody id="rows"></tbody>
         </table>
       </div>
-      <aside>
+      <aside class="detail-panel" id="detailPanel" hidden>
         <div class="detail-head">
           <h2>Event Detail</h2>
           <button type="button" class="icon-button" id="closeDetail" title="Close event detail" aria-label="Close event detail">&times;</button>
         </div>
-        <section class="watch" id="churnWatch"></section>
         <div class="details" id="details">Select a log event.</div>
       </aside>
     </section>
@@ -1353,8 +1362,10 @@ const INDEX_HTML = `<!doctype html>
     const filters = document.querySelector("#filters");
     const rows = document.querySelector("#rows");
     const eventsTable = document.querySelector("#eventsTable");
+    const layout = document.querySelector("#layout");
     const statusEl = document.querySelector("#status");
     const details = document.querySelector("#details");
+    const detailPanel = document.querySelector("#detailPanel");
     const churnWatch = document.querySelector("#churnWatch");
     const statsEl = document.querySelector("#stats");
     const connectedChart = document.querySelector("#connectedChart");
@@ -1446,13 +1457,14 @@ const INDEX_HTML = `<!doctype html>
 
     function renderChurnUsers(users, excessiveCount) {
       if (!users.length) return '<div class="muted">Loading reconnect activity...</div>';
-      const rows = excessiveCount ? users.filter(user => user.severity === "high" || user.severity === "elevated") : users.slice(0, 5);
+      const prioritized = excessiveCount ? users.filter(user => user.severity === "high" || user.severity === "elevated") : users;
+      const rows = prioritized.slice(0, 4);
       if (!rows.length) return '<div class="muted">No excessive reconnect pattern detected.</div>';
+      const more = prioritized.length > rows.length ? '<div class="watch-more">+' + esc(prioritized.length - rows.length) + ' more</div>' : "";
       return rows.map(user => '<div class="watch-user ' + esc(user.severity) + '">' +
-        '<strong>' + esc(user.userName) + '</strong>' +
-        '<span>' + esc(user.total) + ' events: ' + esc(user.connected) + ' connects, ' + esc(user.disconnected) + ' disconnects, ' + esc(user.shortSessions) + ' short sessions</span>' +
-        '<span>Connected for ' + esc(formatDuration(user.connectedForSeconds)) + '</span>' +
-      '</div>').join("");
+        '<button type="button" class="watch-user-link" data-user="' + esc(user.userName) + '" title="Search events for ' + esc(user.userName) + '">' + esc(user.userName) + '</button>' +
+        '<span>' + esc(user.total) + ' events</span>' +
+      '</div>').join("") + more;
     }
 
     function loadColumnWidths() {
@@ -1588,9 +1600,9 @@ const INDEX_HTML = `<!doctype html>
         return;
       }
 
-      const width = 340;
-      const height = 82;
-      const pad = { top: 8, right: 8, bottom: 18, left: 26 };
+      const width = Math.max(340, Math.round(connectedChart.clientWidth || 540));
+      const height = 92;
+      const pad = { top: 8, right: 10, bottom: 18, left: 26 };
       const max = Math.max(1, ...points.map(point => point.connectedUsers));
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
@@ -1664,11 +1676,8 @@ const INDEX_HTML = `<!doctype html>
       sourceLine.textContent = data.source + " | loaded " + (data.loadedAt ? displayTime(data.loadedAt) : "never");
       statusEl.textContent = data.loading ? "Loading logs..." : (data.error || "");
       statusEl.className = data.error ? "status error" : "status";
-      const days = Object.entries(data.byDay || {});
-      const max = Math.max(1, ...days.map(([, count]) => count));
       statsEl.innerHTML = [
-        stat("Active users", data.activeUsers + " users / " + data.activeSessions + " sessions"),
-        '<div class="stat"><strong>' + days.length + '</strong><span>active days</span><div class="bars">' + days.map(([day, count]) => '<div class="bar" title="' + esc(day + ": " + count) + '" style="height:' + Math.max(5, Math.round((count / max) * 34)) + 'px"></div>').join("") + '</div></div>'
+        stat("Active users", data.activeUsers + " users / " + data.activeSessions + " sessions")
       ].join("");
       scheduleLoadingPoll(data.loading);
       return data;
@@ -1685,7 +1694,7 @@ const INDEX_HTML = `<!doctype html>
     async function search() {
       const data = await getJson("/api/search?" + params());
       statusEl.textContent = (statusEl.className.includes("error") ? statusEl.textContent + " | " : "") + "searched " + data.searched + " loaded events; " + data.total + " matched; showing " + data.rows.length + " of " + data.limit;
-      rows.innerHTML = data.rows.map(record => '<tr data-id="' + esc(record.id) + '">' +
+      rows.innerHTML = data.rows.map(record => '<tr data-id="' + esc(record.id) + '"' + (record.id === selectedRecordId ? ' class="selected"' : "") + '>' +
         '<td class="time">' + esc(displayTime(record.timestamp)) + '</td>' +
         '<td class="user wrap">' + esc(record.userName || record.initiatorName) + '</td>' +
         '<td><span class="chip">' + esc(record.eventName || record.operation || "event") + '</span></td>' +
@@ -1695,11 +1704,14 @@ const INDEX_HTML = `<!doctype html>
         '<td>' + esc(formatDuration(record.durationSeconds)) + '</td>' +
         '<td>' + esc(formatBytes((record.bytesIn || 0) + (record.bytesOut || 0))) + '</td>' +
       '</tr>').join("");
+      highlightSelectedRow();
     }
 
     async function selectRecord(id) {
       selectedRecordId = id;
       const record = await getJson("/api/record?id=" + encodeURIComponent(id));
+      detailPanel.hidden = false;
+      layout.classList.add("detail-open");
       closeDetail.style.display = "inline-flex";
       details.innerHTML = '<div class="kv">' +
         kv("Timestamp", displayTime(record.timestamp)) +
@@ -1718,6 +1730,22 @@ const INDEX_HTML = `<!doctype html>
         kv("Trace ID", record.traceId) +
         kv("Source", record.sourceKey + ":" + record.lineNumber) +
       '</div>' + churnPanel(record.churn) + '<pre>' + esc(JSON.stringify(record.raw, null, 2)) + '</pre>';
+      highlightSelectedRow();
+    }
+
+    function clearSelectedRecord() {
+      selectedRecordId = "";
+      detailPanel.hidden = true;
+      layout.classList.remove("detail-open");
+      closeDetail.style.display = "none";
+      details.textContent = "";
+      highlightSelectedRow();
+    }
+
+    function highlightSelectedRow() {
+      for (const tr of rows.querySelectorAll("tr")) {
+        tr.classList.toggle("selected", Boolean(selectedRecordId) && tr.dataset.id === selectedRecordId);
+      }
     }
 
     function kv(key, value) {
@@ -1752,9 +1780,7 @@ const INDEX_HTML = `<!doctype html>
     }
 
     closeDetail.addEventListener("click", () => {
-      selectedRecordId = "";
-      closeDetail.style.display = "none";
-      details.textContent = "Select a log event.";
+      clearSelectedRecord();
     });
 
     function resetIdleReloadTimer() {
@@ -1802,9 +1828,20 @@ const INDEX_HTML = `<!doctype html>
 
     filters.addEventListener("input", () => search().catch(showError));
     filters.addEventListener("change", () => search().catch(showError));
+    churnWatch.addEventListener("click", event => {
+      const link = event.target.closest(".watch-user-link");
+      if (!link) return;
+      filters.elements.q.value = link.dataset.user || "";
+      search().catch(showError);
+    });
     rows.addEventListener("click", event => {
       const tr = event.target.closest("tr");
-      if (tr) selectRecord(tr.dataset.id).catch(showError);
+      if (!tr) return;
+      if (tr.dataset.id === selectedRecordId) {
+        clearSelectedRecord();
+      } else {
+        selectRecord(tr.dataset.id).catch(showError);
+      }
     });
     document.querySelector("#reload").addEventListener("click", async () => {
       statusEl.textContent = "Reloading...";
