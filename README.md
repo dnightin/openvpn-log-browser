@@ -10,6 +10,8 @@ node server.js
 
 Then open `http://localhost:3000`.
 
+Node.js 18 or newer is required for SAML 2.0 SSO support.
+
 You can also verify ingestion without starting the web server:
 
 ```powershell
@@ -40,6 +42,15 @@ MYSQL_PORT=3306
 MYSQL_USER=openvpn_log_browser
 MYSQL_PASSWORD=<password>
 MYSQL_DATABASE=openvpn_log_browser
+
+# Optional SAML 2.0 SSO.
+SAML_ENABLED=false
+SAML_REQUIRE_AUTH=false
+SAML_SP_ENTITY_ID=openvpn-log-browser
+SAML_CALLBACK_URL=https://logs.example.edu/auth/saml/callback
+SAML_ENTRY_POINT=https://idp.example.edu/sso/saml
+SAML_LOGOUT_URL=https://idp.example.edu/slo/saml
+SAML_IDP_CERT=<idp signing certificate>
 ```
 
 When MySQL is configured, the app stores only aggregate licensing telemetry:
@@ -50,6 +61,8 @@ When MySQL is configured, the app stores only aggregate licensing telemetry:
 
 The `connected_user_counts` table contains only those three columns.
 No usernames, IPs, session IDs, raw logs, or event payloads are written to MySQL. Samples older than 365 days are deleted automatically.
+
+SAML settings can also be managed in the app from `Account` -> `Settings`. The app exposes SP metadata at `/auth/saml/metadata` after SAML is configured.
 
 ## S3 Bucket Access
 

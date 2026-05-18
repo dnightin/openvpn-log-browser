@@ -3,6 +3,8 @@ const https = require("node:https");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const zlib = require("node:zlib");
+const crypto = require("node:crypto");
+const querystring = require("node:querystring");
 const { promisify } = require("node:util");
 
 const gunzip = promisify(zlib.gunzip);
@@ -11,9 +13,12 @@ const PORT = Number(process.env.PORT || 3000);
 const BUCKET_URL = ensureTrailingSlash(process.env.S3_BUCKET_URL || "https://wc-openvpnlogs.s3.us-east-1.amazonaws.com/");
 const LOG_PREFIX = process.env.LOG_PREFIX || "CloudConnexa/wellesley/";
 const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
+const SETTINGS_DIR = process.env.SETTINGS_DIR || path.join(__dirname, "data", "settings");
+const SAML_SETTINGS_PATH = process.env.SAML_SETTINGS_PATH || path.join(SETTINGS_DIR, "saml.json");
 const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 25));
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 72));
+const SESSION_COOKIE = "openvpn_log_browser_session";
 const MYSQL_ENABLED = Boolean(process.env.MYSQL_HOST || process.env.MYSQL_USER || process.env.MYSQL_DATABASE);
 const MYSQL_CONFIG = {
   host: process.env.MYSQL_HOST || "127.0.0.1",
@@ -34,9 +39,203 @@ let store = {
 let refreshPromise = null;
 let mysqlPool = null;
 let mysqlStatus = MYSQL_ENABLED ? "not connected" : "disabled";
+let samlSettings = envSamlSettings();
+const sessions = new Map();
+
+function envSamlSettings() {
+  return {
+    enabled: toBool(process.env.SAML_ENABLED),
+    requireAuth: toBool(process.env.SAML_REQUIRE_AUTH),
+    issuer: process.env.SAML_SP_ENTITY_ID || process.env.SAML_ISSUER || "openvpn-log-browser",
+    callbackUrl: process.env.SAML_CALLBACK_URL || "",
+    entryPoint: process.env.SAML_ENTRY_POINT || "",
+    logoutUrl: process.env.SAML_LOGOUT_URL || "",
+    idpCert: process.env.SAML_IDP_CERT || "",
+    audience: process.env.SAML_AUDIENCE || "",
+    wantAssertionsSigned: process.env.SAML_WANT_ASSERTIONS_SIGNED !== "false",
+    wantAuthnResponseSigned: toBool(process.env.SAML_WANT_RESPONSE_SIGNED),
+    disableRequestedAuthnContext: process.env.SAML_DISABLE_REQUESTED_AUTHN_CONTEXT !== "false"
+  };
+}
+
+function toBool(value) {
+  return value === true || value === "true" || value === "1" || value === "yes";
+}
 
 function ensureTrailingSlash(value) {
   return value.endsWith("/") ? value : `${value}/`;
+}
+
+async function loadSamlSettings() {
+  try {
+    const saved = JSON.parse(await fs.readFile(SAML_SETTINGS_PATH, "utf8"));
+    samlSettings = { ...envSamlSettings(), ...cleanSamlSettings(saved) };
+  } catch (error) {
+    if (error.code !== "ENOENT") console.error(error);
+    samlSettings = envSamlSettings();
+  }
+}
+
+async function saveSamlSettings(settings) {
+  const cleaned = cleanSamlSettings(settings);
+  await fs.mkdir(path.dirname(SAML_SETTINGS_PATH), { recursive: true });
+  await fs.writeFile(SAML_SETTINGS_PATH, JSON.stringify(cleaned, null, 2));
+  samlSettings = { ...envSamlSettings(), ...cleaned };
+}
+
+function cleanSamlSettings(settings = {}) {
+  return {
+    enabled: Boolean(settings.enabled),
+    requireAuth: Boolean(settings.requireAuth),
+    issuer: String(settings.issuer || "openvpn-log-browser").trim(),
+    callbackUrl: String(settings.callbackUrl || "").trim(),
+    entryPoint: String(settings.entryPoint || "").trim(),
+    logoutUrl: String(settings.logoutUrl || "").trim(),
+    idpCert: String(settings.idpCert || "").trim(),
+    audience: String(settings.audience || "").trim(),
+    wantAssertionsSigned: settings.wantAssertionsSigned !== false,
+    wantAuthnResponseSigned: Boolean(settings.wantAuthnResponseSigned),
+    disableRequestedAuthnContext: settings.disableRequestedAuthnContext !== false
+  };
+}
+
+function publicSamlSettings(req) {
+  const settings = samlConfig(req);
+  return {
+    enabled: settings.enabled,
+    requireAuth: settings.requireAuth,
+    issuer: settings.issuer,
+    callbackUrl: settings.callbackUrl,
+    entryPoint: settings.entryPoint,
+    logoutUrl: settings.logoutUrl,
+    audience: settings.audience,
+    wantAssertionsSigned: settings.wantAssertionsSigned,
+    wantAuthnResponseSigned: settings.wantAuthnResponseSigned,
+    disableRequestedAuthnContext: settings.disableRequestedAuthnContext,
+    hasIdpCert: Boolean(settings.idpCert),
+    idpCert: settings.idpCert,
+    metadataUrl: `${requestOrigin(req)}/auth/saml/metadata`
+  };
+}
+
+function samlConfig(req) {
+  const origin = requestOrigin(req);
+  return {
+    ...samlSettings,
+    callbackUrl: samlSettings.callbackUrl || `${origin}/auth/saml/callback`
+  };
+}
+
+function requestOrigin(req) {
+  const proto = req.headers["x-forwarded-proto"] || "http";
+  return `${proto}://${req.headers.host || `localhost:${PORT}`}`;
+}
+
+function samlReady(req) {
+  const settings = samlConfig(req);
+  return Boolean(settings.enabled && settings.entryPoint && settings.idpCert && settings.issuer);
+}
+
+function getSaml(req) {
+  const settings = samlConfig(req);
+  const { SAML } = require("@node-saml/node-saml");
+  return new SAML({
+    entryPoint: settings.entryPoint,
+    issuer: settings.issuer,
+    callbackUrl: settings.callbackUrl,
+    idpCert: settings.idpCert,
+    audience: settings.audience || settings.issuer,
+    wantAssertionsSigned: settings.wantAssertionsSigned,
+    wantAuthnResponseSigned: settings.wantAuthnResponseSigned,
+    disableRequestedAuthnContext: settings.disableRequestedAuthnContext
+  });
+}
+
+function currentUser(req) {
+  const cookies = parseCookies(req.headers.cookie || "");
+  const sessionId = cookies[SESSION_COOKIE];
+  const session = sessionId ? sessions.get(sessionId) : null;
+  if (!session) return { authenticated: false, name: "", email: "", source: "none" };
+  session.lastSeen = Date.now();
+  return { authenticated: true, ...session.user };
+}
+
+function createSession(res, profile = {}) {
+  const sessionId = crypto.randomBytes(32).toString("base64url");
+  const user = {
+    name: profile.displayName || profile.name || profile.cn || profile.email || profile.nameID || "SAML user",
+    email: profile.email || profile.mail || profile.nameID || "",
+    source: "saml"
+  };
+  sessions.set(sessionId, { user, createdAt: Date.now(), lastSeen: Date.now() });
+  setCookie(res, SESSION_COOKIE, sessionId, { httpOnly: true, sameSite: "Lax", path: "/" });
+  return user;
+}
+
+function clearSession(req, res) {
+  const cookies = parseCookies(req.headers.cookie || "");
+  if (cookies[SESSION_COOKIE]) sessions.delete(cookies[SESSION_COOKIE]);
+  setCookie(res, SESSION_COOKIE, "", { maxAge: 0, httpOnly: true, sameSite: "Lax", path: "/" });
+}
+
+function parseCookies(header) {
+  return Object.fromEntries(header.split(";").map((part) => {
+    const [key, ...rest] = part.trim().split("=");
+    return [key, decodeURIComponent(rest.join("=") || "")];
+  }).filter(([key]) => key));
+}
+
+function setCookie(res, name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.httpOnly) parts.push("HttpOnly");
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  if (options.path) parts.push(`Path=${options.path}`);
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function redirect(res, location) {
+  res.writeHead(302, { Location: location });
+  res.end();
+}
+
+async function readRequestBody(req, limit = 2 * 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error("Request body too large");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readJsonBody(req) {
+  const body = await readRequestBody(req);
+  return body ? JSON.parse(body) : {};
+}
+
+async function samlLogin(req, res) {
+  if (!samlReady(req)) return json(res, { error: "SAML is not configured." }, 400);
+  const redirectTo = new URL(req.url, requestOrigin(req)).searchParams.get("returnTo") || "/";
+  const saml = getSaml(req);
+  const url = await saml.getAuthorizeUrlAsync(redirectTo, undefined, {});
+  redirect(res, url);
+}
+
+async function samlCallback(req, res) {
+  if (!samlReady(req)) return json(res, { error: "SAML is not configured." }, 400);
+  const body = querystring.parse(await readRequestBody(req));
+  const result = await getSaml(req).validatePostResponseAsync(body);
+  createSession(res, result.profile || result);
+  redirect(res, String(body.RelayState || "/"));
+}
+
+async function samlMetadata(req, res) {
+  if (!samlReady(req)) return json(res, { error: "SAML is not configured." }, 400);
+  const metadata = getSaml(req).generateServiceProviderMetadata(null, null);
+  res.writeHead(200, { "Content-Type": "application/xml; charset=utf-8" });
+  res.end(metadata);
 }
 
 async function httpGetBuffer(url, attempts = 3) {
@@ -802,7 +1001,25 @@ function notFound(res) {
 async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (url.pathname === "/auth/saml/login") return samlLogin(req, res);
+    if (url.pathname === "/auth/saml/callback" && req.method === "POST") return samlCallback(req, res);
+    if (url.pathname === "/auth/saml/metadata") return samlMetadata(req, res);
+    if (url.pathname === "/auth/logout") {
+      clearSession(req, res);
+      return redirect(res, "/");
+    }
+    if (samlSettings.requireAuth && !currentUser(req).authenticated && url.pathname !== "/" && url.pathname !== "/api/auth") return json(res, { error: "Authentication required" }, 401);
     if (url.pathname === "/") return html(res);
+    if (url.pathname === "/api/auth") return json(res, { user: currentUser(req), saml: { enabled: samlConfig(req).enabled, ready: samlReady(req), requireAuth: samlConfig(req).requireAuth } });
+    if (url.pathname === "/api/settings/saml" && req.method === "GET") return json(res, publicSamlSettings(req));
+    if (url.pathname === "/api/settings/saml" && req.method === "POST") {
+      const nextSettings = cleanSamlSettings(await readJsonBody(req));
+      if (nextSettings.requireAuth && (!nextSettings.enabled || !nextSettings.entryPoint || !nextSettings.idpCert || !nextSettings.issuer)) {
+        return json(res, { error: "Require SSO can only be enabled after SAML login URL, entity ID, and IdP certificate are configured." }, 400);
+      }
+      await saveSamlSettings(nextSettings);
+      return json(res, publicSamlSettings(req));
+    }
     if (url.pathname === "/api/stats") return json(res, stats(url.searchParams.get("timeZone") || "UTC"));
     if (url.pathname === "/api/facets") return json(res, facets());
     if (url.pathname === "/api/churn") {
@@ -857,19 +1074,25 @@ const INDEX_HTML = `<!doctype html>
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; }
-    header { background: #111827; color: white; padding: 18px 24px; }
+    body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; height: 100dvh; overflow: hidden; }
+    header { background: #111827; color: white; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+    .brand { min-width: 0; }
     header h1 { margin: 0; font-size: 22px; font-weight: 720; letter-spacing: 0; }
     header .sub { margin-top: 4px; color: #cbd5e1; font-size: 13px; }
-    main { padding: 18px 24px 28px; max-width: 1500px; margin: 0 auto; height: calc(100vh - 65px); display: flex; flex-direction: column; min-height: 0; }
-    .dashboard-top { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 10px; margin-bottom: 14px; align-items: stretch; }
-    .stats { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 10px; min-width: 0; }
+    .account { position: relative; flex: 0 0 auto; }
+    .menu-button { background: transparent; border-color: #374151; color: white; display: inline-flex; align-items: center; gap: 8px; }
+    .menu-button:hover { background: #1f2937; }
+    .account-menu { position: absolute; right: 0; top: calc(100% + 8px); width: 220px; background: white; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 14px 28px rgba(15, 23, 42, .18); padding: 6px; display: none; z-index: 5; }
+    .account.open .account-menu { display: grid; gap: 4px; }
+    .account-menu button, .account-menu a { height: 34px; border: 0; background: white; color: var(--text); border-radius: 6px; padding: 0 9px; text-align: left; text-decoration: none; display: flex; align-items: center; font-weight: 650; }
+    .account-menu button:hover, .account-menu a:hover { background: #f1f5f9; }
+    .account-name { padding: 7px 9px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    main { padding: 18px 24px 28px; max-width: 1500px; margin: 0 auto; height: calc(100vh - 65px); height: calc(100dvh - 65px); display: flex; flex-direction: column; min-height: 0; width: 100%; }
+    .dashboard-top { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(280px, 340px); gap: 10px; margin-bottom: 14px; align-items: stretch; flex: 0 0 auto; }
+    .stats { display: grid; grid-template-columns: repeat(2, minmax(150px, 1fr)); gap: 10px; min-width: 0; }
     .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
     .stat strong { display: block; font-size: 20px; }
     .stat span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .stat-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .stat-head strong { display: inline; }
-    .stat select { height: 28px; padding: 0 7px; font-size: 12px; max-width: 145px; }
     .chart-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 126px; min-width: 0; }
     .chart-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; margin-bottom: 5px; }
     .chart-head h2 { margin: 0; font-size: 13px; line-height: 1.25; }
@@ -882,25 +1105,42 @@ const INDEX_HTML = `<!doctype html>
     .chart-area { fill: rgba(22, 108, 125, .12); }
     .chart-dot { fill: var(--accent); }
     .chart-label { fill: var(--muted); font-size: 11px; }
-    .toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 150px 160px 130px 170px 140px 140px 110px 150px; gap: 8px; align-items: end; margin-bottom: 14px; }
+    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(120px, 150px) minmax(130px, 160px) minmax(110px, 130px) minmax(140px, 170px) minmax(110px, 140px) minmax(110px, 140px) 96px 150px; gap: 8px; align-items: end; margin-bottom: 14px; flex: 0 0 auto; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
     input, select, button { height: 38px; border-radius: 7px; border: 1px solid var(--line); background: white; color: var(--text); padding: 0 10px; font: inherit; min-width: 0; }
     button { background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 700; }
     button.secondary { background: white; color: var(--accent); }
     .toolbar-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-self: end; }
     .toolbar-actions button { width: 100%; }
-    .status { margin: 6px 0 12px; color: var(--muted); font-size: 13px; }
+    .status { margin: 6px 0 12px; color: var(--muted); font-size: 13px; min-height: 18px; flex: 0 0 auto; }
     .status.error { color: var(--danger); }
     .muted { color: var(--muted); font-size: 12px; }
-    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 14px; align-items: stretch; min-height: 0; flex: 1; }
-    .table-scroll { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
-    table { width: 100%; border-collapse: collapse; background: var(--panel); }
-    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; }
-    th { color: var(--muted); background: #f1f5f9; font-size: 12px; position: sticky; top: 0; z-index: 1; }
+    dialog { border: 1px solid var(--line); border-radius: 8px; padding: 0; width: min(760px, calc(100vw - 24px)); max-height: calc(100vh - 40px); box-shadow: 0 24px 80px rgba(15, 23, 42, .24); }
+    dialog::backdrop { background: rgba(15, 23, 42, .4); }
+    .settings { padding: 16px; display: grid; gap: 14px; }
+    .settings header { background: transparent; color: var(--text); padding: 0 0 10px; border-bottom: 1px solid var(--line); }
+    .settings h2, .settings h3 { margin: 0; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .settings textarea { min-height: 130px; resize: vertical; border-radius: 7px; border: 1px solid var(--line); padding: 9px 10px; font: inherit; }
+    .settings .wide { grid-column: 1 / -1; }
+    .check-row { display: flex; align-items: center; gap: 8px; min-height: 38px; color: var(--text); }
+    .check-row input { height: auto; }
+    .settings-actions { display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 420px); gap: 14px; align-items: stretch; min-height: 0; flex: 1 1 auto; }
+    .table-scroll { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); contain: size layout paint; }
+    table { width: max-content; min-width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--panel); }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+    th { color: var(--muted); background: #f1f5f9; font-size: 12px; position: sticky; top: 0; z-index: 1; user-select: none; }
+    th .th-label { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 9px; }
+    .col-resizer { position: absolute; top: 0; right: -3px; width: 7px; height: 100%; cursor: col-resize; touch-action: none; z-index: 2; }
+    .col-resizer::after { content: ""; position: absolute; top: 8px; bottom: 8px; left: 3px; width: 1px; background: transparent; }
+    th:hover .col-resizer::after, body.resizing-columns .col-resizer::after { background: #aab4c3; }
+    body.resizing-columns { cursor: col-resize; user-select: none; }
     tr { cursor: pointer; }
     tr:hover td { background: #f8fbfc; }
     td.time { white-space: nowrap; font-variant-numeric: tabular-nums; }
     td.ip, td.user, td.op { overflow-wrap: anywhere; }
+    td.wrap { white-space: normal; overflow-wrap: anywhere; }
     .chip { display: inline-flex; align-items: center; min-height: 23px; padding: 2px 8px; border-radius: 999px; background: var(--chip); color: #28505a; font-size: 12px; font-weight: 650; }
     aside { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-height: 0; overflow: auto; }
     aside h2 { margin: 0; padding: 13px 14px; font-size: 15px; }
@@ -937,7 +1177,7 @@ const INDEX_HTML = `<!doctype html>
     .bars { display: flex; gap: 2px; align-items: end; height: 34px; margin-top: 8px; }
     .bar { background: var(--accent-2); min-width: 3px; flex: 1; border-radius: 2px 2px 0 0; opacity: .8; }
     @media (max-width: 1100px) {
-      .toolbar { grid-template-columns: 1fr 1fr; }
+      .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .layout { grid-template-columns: 1fr; }
       aside { min-height: 420px; }
       .dashboard-top { grid-template-columns: 1fr; }
@@ -952,14 +1192,24 @@ const INDEX_HTML = `<!doctype html>
       .chart-head { grid-template-columns: 1fr; }
       .chart-controls { justify-items: start; }
       .table-scroll { max-height: 65vh; }
-      th:nth-child(4), td:nth-child(4), th:nth-child(6), td:nth-child(6), th:nth-child(7), td:nth-child(7) { display: none; }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>OpenVPN Log Search</h1>
-    <div class="sub" id="sourceLine">Loading authorized CloudConnexa audit logs...</div>
+    <div class="brand">
+      <h1>OpenVPN Log Search</h1>
+      <div class="sub" id="sourceLine">Loading authorized CloudConnexa audit logs...</div>
+    </div>
+    <div class="account" id="accountMenu">
+      <button type="button" class="menu-button" id="accountMenuButton" aria-haspopup="true" aria-expanded="false">Account</button>
+      <div class="account-menu" role="menu">
+        <div class="account-name" id="accountName">Not signed in</div>
+        <a href="/auth/saml/login" id="loginLink" role="menuitem">Login</a>
+        <a href="/auth/logout" id="logoutLink" role="menuitem">Logout</a>
+        <button type="button" id="settingsButton" role="menuitem">Settings</button>
+      </div>
+    </div>
   </header>
   <main>
     <section class="dashboard-top">
@@ -1018,17 +1268,27 @@ const INDEX_HTML = `<!doctype html>
     <div class="status" id="status"></div>
     <section class="layout">
       <div class="table-scroll">
-        <table>
+        <table id="eventsTable">
+          <colgroup>
+            <col data-col="time">
+            <col data-col="user">
+            <col data-col="event">
+            <col data-col="device">
+            <col data-col="ip">
+            <col data-col="gateway">
+            <col data-col="duration">
+            <col data-col="transfer">
+          </colgroup>
           <thead>
             <tr>
-              <th>Time</th>
-              <th>User</th>
-              <th>Event</th>
-              <th>Device</th>
-              <th>IP / Tunnel</th>
-              <th>Gateway</th>
-              <th>Duration</th>
-              <th>Transfer</th>
+              <th data-col="time"><span class="th-label">Time</span><span class="col-resizer" role="separator" aria-label="Resize Time column"></span></th>
+              <th data-col="user"><span class="th-label">User</span><span class="col-resizer" role="separator" aria-label="Resize User column"></span></th>
+              <th data-col="event"><span class="th-label">Event</span><span class="col-resizer" role="separator" aria-label="Resize Event column"></span></th>
+              <th data-col="device"><span class="th-label">Device</span><span class="col-resizer" role="separator" aria-label="Resize Device column"></span></th>
+              <th data-col="ip"><span class="th-label">IP / Tunnel</span><span class="col-resizer" role="separator" aria-label="Resize IP / Tunnel column"></span></th>
+              <th data-col="gateway"><span class="th-label">Gateway</span><span class="col-resizer" role="separator" aria-label="Resize Gateway column"></span></th>
+              <th data-col="duration"><span class="th-label">Duration</span><span class="col-resizer" role="separator" aria-label="Resize Duration column"></span></th>
+              <th data-col="transfer"><span class="th-label">Transfer</span><span class="col-resizer" role="separator" aria-label="Resize Transfer column"></span></th>
             </tr>
           </thead>
           <tbody id="rows"></tbody>
@@ -1044,9 +1304,55 @@ const INDEX_HTML = `<!doctype html>
       </aside>
     </section>
   </main>
+  <dialog id="settingsDialog">
+    <form class="settings" id="settingsForm" method="dialog">
+      <header>
+        <h2>Settings</h2>
+      </header>
+      <section class="settings-grid">
+        <label class="wide">Display timezone
+          <select id="settingsTimeZone"></select>
+        </label>
+      </section>
+      <section class="settings-grid">
+        <h3 class="wide">SAML 2.0 SSO</h3>
+        <label class="check-row"><input type="checkbox" name="enabled"> Enable SAML login</label>
+        <label class="check-row"><input type="checkbox" name="requireAuth"> Require SSO for API access</label>
+        <label>SP entity ID
+          <input name="issuer" autocomplete="off">
+        </label>
+        <label>SP ACS callback URL
+          <input name="callbackUrl" autocomplete="off" placeholder="Auto-generated if blank">
+        </label>
+        <label>IdP login URL
+          <input name="entryPoint" autocomplete="off">
+        </label>
+        <label>IdP logout URL
+          <input name="logoutUrl" autocomplete="off">
+        </label>
+        <label class="wide">Audience
+          <input name="audience" autocomplete="off" placeholder="Defaults to SP entity ID">
+        </label>
+        <label class="wide">IdP signing certificate
+          <textarea name="idpCert" spellcheck="false"></textarea>
+        </label>
+        <label class="check-row"><input type="checkbox" name="wantAssertionsSigned"> Require signed assertions</label>
+        <label class="check-row"><input type="checkbox" name="wantAuthnResponseSigned"> Require signed responses</label>
+        <label class="check-row wide"><input type="checkbox" name="disableRequestedAuthnContext"> Let the IdP choose auth context</label>
+        <label class="wide">SP metadata URL
+          <input id="metadataUrl" readonly>
+        </label>
+      </section>
+      <div class="settings-actions">
+        <button type="button" class="secondary" id="closeSettings">Close</button>
+        <button type="submit">Save Settings</button>
+      </div>
+    </form>
+  </dialog>
   <script>
     const filters = document.querySelector("#filters");
     const rows = document.querySelector("#rows");
+    const eventsTable = document.querySelector("#eventsTable");
     const statusEl = document.querySelector("#status");
     const details = document.querySelector("#details");
     const churnWatch = document.querySelector("#churnWatch");
@@ -1056,8 +1362,40 @@ const INDEX_HTML = `<!doctype html>
     const connectedRange = document.querySelector("#connectedRange");
     const sourceLine = document.querySelector("#sourceLine");
     const closeDetail = document.querySelector("#closeDetail");
+    const accountMenu = document.querySelector("#accountMenu");
+    const accountMenuButton = document.querySelector("#accountMenuButton");
+    const accountName = document.querySelector("#accountName");
+    const loginLink = document.querySelector("#loginLink");
+    const logoutLink = document.querySelector("#logoutLink");
+    const settingsButton = document.querySelector("#settingsButton");
+    const settingsDialog = document.querySelector("#settingsDialog");
+    const settingsForm = document.querySelector("#settingsForm");
+    const settingsTimeZone = document.querySelector("#settingsTimeZone");
+    const closeSettings = document.querySelector("#closeSettings");
+    const metadataUrl = document.querySelector("#metadataUrl");
     const IDLE_RELOAD_MS = 30 * 60 * 1000;
     const TIME_ZONE_STORAGE_KEY = "openvpnLogBrowserTimeZone";
+    const COLUMN_WIDTH_STORAGE_KEY = "openvpnLogBrowserColumnWidths";
+    const defaultColumnWidths = {
+      time: 205,
+      user: 210,
+      event: 150,
+      device: 230,
+      ip: 250,
+      gateway: 230,
+      duration: 105,
+      transfer: 110
+    };
+    const minColumnWidths = {
+      time: 150,
+      user: 130,
+      event: 105,
+      device: 150,
+      ip: 160,
+      gateway: 150,
+      duration: 88,
+      transfer: 90
+    };
     const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
     const timeZones = Array.from(new Set([
       localTimeZone,
@@ -1117,6 +1455,124 @@ const INDEX_HTML = `<!doctype html>
       '</div>').join("");
     }
 
+    function loadColumnWidths() {
+      try {
+        return { ...defaultColumnWidths, ...JSON.parse(localStorage.getItem(COLUMN_WIDTH_STORAGE_KEY) || "{}") };
+      } catch {
+        return { ...defaultColumnWidths };
+      }
+    }
+
+    function saveColumnWidths(widths) {
+      localStorage.setItem(COLUMN_WIDTH_STORAGE_KEY, JSON.stringify(widths));
+    }
+
+    function applyColumnWidths(widths = loadColumnWidths()) {
+      for (const col of eventsTable.querySelectorAll("col[data-col]")) {
+        const key = col.dataset.col;
+        const min = minColumnWidths[key] || 80;
+        const width = Math.max(min, Number(widths[key] || defaultColumnWidths[key] || min));
+        col.style.width = width + "px";
+      }
+    }
+
+    function setupResizableColumns() {
+      applyColumnWidths();
+      eventsTable.querySelectorAll("th[data-col]").forEach(th => {
+        const handle = th.querySelector(".col-resizer");
+        if (!handle) return;
+        handle.addEventListener("pointerdown", event => {
+          event.preventDefault();
+          event.stopPropagation();
+          const key = th.dataset.col;
+          const widths = loadColumnWidths();
+          const startX = event.clientX;
+          const startWidth = Number(widths[key] || th.getBoundingClientRect().width || defaultColumnWidths[key]);
+          const min = minColumnWidths[key] || 80;
+          document.body.classList.add("resizing-columns");
+          handle.setPointerCapture(event.pointerId);
+
+          const move = moveEvent => {
+            widths[key] = Math.max(min, Math.round(startWidth + moveEvent.clientX - startX));
+            applyColumnWidths(widths);
+          };
+          const up = () => {
+            document.body.classList.remove("resizing-columns");
+            saveColumnWidths(widths);
+            handle.removeEventListener("pointermove", move);
+            handle.removeEventListener("pointerup", up);
+            handle.removeEventListener("pointercancel", up);
+          };
+
+          handle.addEventListener("pointermove", move);
+          handle.addEventListener("pointerup", up);
+          handle.addEventListener("pointercancel", up);
+        });
+      });
+    }
+
+    async function loadAuth() {
+      const data = await getJson("/api/auth");
+      accountName.textContent = data.user && data.user.authenticated
+        ? (data.user.email || data.user.name || "Signed in")
+        : "Not signed in";
+      loginLink.style.display = data.saml && data.saml.ready ? "flex" : "none";
+      logoutLink.style.display = data.user && data.user.authenticated ? "flex" : "none";
+      accountMenuButton.textContent = data.user && data.user.authenticated ? "Account" : "Menu";
+      return data;
+    }
+
+    async function loadSettings() {
+      fillTimeZoneSettings();
+      const saml = await getJson("/api/settings/saml");
+      settingsForm.elements.enabled.checked = Boolean(saml.enabled);
+      settingsForm.elements.requireAuth.checked = Boolean(saml.requireAuth);
+      settingsForm.elements.issuer.value = saml.issuer || "";
+      settingsForm.elements.callbackUrl.value = saml.callbackUrl || "";
+      settingsForm.elements.entryPoint.value = saml.entryPoint || "";
+      settingsForm.elements.logoutUrl.value = saml.logoutUrl || "";
+      settingsForm.elements.audience.value = saml.audience || "";
+      settingsForm.elements.idpCert.value = saml.idpCert || "";
+      settingsForm.elements.wantAssertionsSigned.checked = Boolean(saml.wantAssertionsSigned);
+      settingsForm.elements.wantAuthnResponseSigned.checked = Boolean(saml.wantAuthnResponseSigned);
+      settingsForm.elements.disableRequestedAuthnContext.checked = Boolean(saml.disableRequestedAuthnContext);
+      metadataUrl.value = saml.metadataUrl || "";
+    }
+
+    function fillTimeZoneSettings() {
+      settingsTimeZone.innerHTML = timeZones.map(zone =>
+        '<option value="' + esc(zone) + '"' + (zone === selectedTimeZone ? " selected" : "") + '>' + esc(zoneLabel(zone)) + '</option>'
+      ).join("");
+    }
+
+    async function saveSettings() {
+      selectedTimeZone = validTimeZone(settingsTimeZone.value);
+      localStorage.setItem(TIME_ZONE_STORAGE_KEY, selectedTimeZone);
+      await getJson("/api/settings/saml", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: settingsForm.elements.enabled.checked,
+          requireAuth: settingsForm.elements.requireAuth.checked,
+          issuer: settingsForm.elements.issuer.value,
+          callbackUrl: settingsForm.elements.callbackUrl.value,
+          entryPoint: settingsForm.elements.entryPoint.value,
+          logoutUrl: settingsForm.elements.logoutUrl.value,
+          audience: settingsForm.elements.audience.value,
+          idpCert: settingsForm.elements.idpCert.value,
+          wantAssertionsSigned: settingsForm.elements.wantAssertionsSigned.checked,
+          wantAuthnResponseSigned: settingsForm.elements.wantAuthnResponseSigned.checked,
+          disableRequestedAuthnContext: settingsForm.elements.disableRequestedAuthnContext.checked
+        })
+      });
+      settingsDialog.close();
+      await loadAuth();
+      await loadStats();
+      await loadConnectedChart();
+      await search();
+      if (selectedRecordId) await selectRecord(selectedRecordId);
+    }
+
     async function loadConnectedChart() {
       const data = await getJson("/api/connected-users?range=" + encodeURIComponent(connectedRange.value));
       renderConnectedChart(data);
@@ -1125,7 +1581,7 @@ const INDEX_HTML = `<!doctype html>
     function renderConnectedChart(data) {
       const points = data.points || [];
       connectedChartMeta.textContent = points.length
-        ? (data.source === "mysql" ? "MySQL, " : "live, ") + "excluding " + (data.excludedUsers ?? latestExcluded(points)) + " reconnect-heavy users"
+        ? "excluding " + (data.excludedUsers ?? latestExcluded(points)) + " reconnect-heavy users"
         : "No connection data loaded";
       if (!points.length) {
         connectedChart.innerHTML = '<div class="muted">Loading connection trend...</div>';
@@ -1212,9 +1668,8 @@ const INDEX_HTML = `<!doctype html>
       const max = Math.max(1, ...days.map(([, count]) => count));
       statsEl.innerHTML = [
         stat("Active users", data.activeUsers + " users / " + data.activeSessions + " sessions"),
-        '<div class="stat"><div class="stat-head"><strong>' + days.length + '</strong>' + timeZoneSelect() + '</div><span>active days</span><div class="bars">' + days.map(([day, count]) => '<div class="bar" title="' + esc(day + ": " + count) + '" style="height:' + Math.max(5, Math.round((count / max) * 34)) + 'px"></div>').join("") + '</div></div>'
+        '<div class="stat"><strong>' + days.length + '</strong><span>active days</span><div class="bars">' + days.map(([day, count]) => '<div class="bar" title="' + esc(day + ": " + count) + '" style="height:' + Math.max(5, Math.round((count / max) * 34)) + 'px"></div>').join("") + '</div></div>'
       ].join("");
-      bindTimeZoneSelect();
       scheduleLoadingPoll(data.loading);
       return data;
     }
@@ -1223,27 +1678,8 @@ const INDEX_HTML = `<!doctype html>
       return '<div class="stat"><strong>' + esc(value) + '</strong><span>' + esc(label) + '</span></div>';
     }
 
-    function timeZoneSelect() {
-      return '<select id="timeZone" aria-label="Display timezone">' + timeZones.map(zone =>
-        '<option value="' + esc(zone) + '"' + (zone === selectedTimeZone ? " selected" : "") + '>' + esc(zoneLabel(zone)) + '</option>'
-      ).join("") + '</select>';
-    }
-
     function zoneLabel(zone) {
       return zone === localTimeZone ? "Local (" + zone + ")" : zone;
-    }
-
-    function bindTimeZoneSelect() {
-      const select = document.querySelector("#timeZone");
-      if (!select) return;
-      select.addEventListener("change", () => {
-        selectedTimeZone = validTimeZone(select.value);
-        localStorage.setItem(TIME_ZONE_STORAGE_KEY, selectedTimeZone);
-        loadStats().catch(showError);
-        loadConnectedChart().catch(showError);
-        search().catch(showError);
-        if (selectedRecordId) selectRecord(selectedRecordId).catch(showError);
-      });
     }
 
     async function search() {
@@ -1251,11 +1687,11 @@ const INDEX_HTML = `<!doctype html>
       statusEl.textContent = (statusEl.className.includes("error") ? statusEl.textContent + " | " : "") + "searched " + data.searched + " loaded events; " + data.total + " matched; showing " + data.rows.length + " of " + data.limit;
       rows.innerHTML = data.rows.map(record => '<tr data-id="' + esc(record.id) + '">' +
         '<td class="time">' + esc(displayTime(record.timestamp)) + '</td>' +
-        '<td class="user">' + esc(record.userName || record.initiatorName) + '</td>' +
+        '<td class="user wrap">' + esc(record.userName || record.initiatorName) + '</td>' +
         '<td><span class="chip">' + esc(record.eventName || record.operation || "event") + '</span></td>' +
-        '<td>' + esc(record.deviceName || record.entityName) + '<br><span class="muted">' + esc(record.os) + '</span></td>' +
-        '<td class="ip">' + esc(record.publicIp) + '<br><span class="muted">' + esc(record.tunnelIp) + '</span></td>' +
-        '<td>' + esc(record.gateway || record.gatewayRegion) + '<br><span class="muted">' + esc(record.protocol) + '</span></td>' +
+        '<td class="wrap">' + esc(record.deviceName || record.entityName) + '<br><span class="muted">' + esc(record.os) + '</span></td>' +
+        '<td class="ip wrap">' + esc(record.publicIp) + '<br><span class="muted">' + esc(record.tunnelIp) + '</span></td>' +
+        '<td class="wrap">' + esc(record.gateway || record.gatewayRegion) + '<br><span class="muted">' + esc(record.protocol) + '</span></td>' +
         '<td>' + esc(formatDuration(record.durationSeconds)) + '</td>' +
         '<td>' + esc(formatBytes((record.bytesIn || 0) + (record.bytesOut || 0))) + '</td>' +
       '</tr>').join("");
@@ -1380,6 +1816,27 @@ const INDEX_HTML = `<!doctype html>
       search().catch(showError);
     });
     connectedRange.addEventListener("change", () => loadConnectedChart().catch(showError));
+    accountMenuButton.addEventListener("click", () => {
+      const open = !accountMenu.classList.contains("open");
+      accountMenu.classList.toggle("open", open);
+      accountMenuButton.setAttribute("aria-expanded", String(open));
+    });
+    document.addEventListener("click", (event) => {
+      if (!accountMenu.contains(event.target)) {
+        accountMenu.classList.remove("open");
+        accountMenuButton.setAttribute("aria-expanded", "false");
+      }
+    });
+    settingsButton.addEventListener("click", async () => {
+      accountMenu.classList.remove("open");
+      await loadSettings();
+      settingsDialog.showModal();
+    });
+    closeSettings.addEventListener("click", () => settingsDialog.close());
+    settingsForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      saveSettings().catch(showError);
+    });
 
     function showError(error) {
       statusEl.textContent = error.message;
@@ -1387,6 +1844,8 @@ const INDEX_HTML = `<!doctype html>
     }
 
     async function boot() {
+      await loadAuth();
+      applyColumnWidths();
       await loadStats();
       await loadFacets();
       await loadChurnWatch();
@@ -1403,13 +1862,14 @@ const INDEX_HTML = `<!doctype html>
       }, 5000);
     }
 
+    setupResizableColumns();
     boot().catch(showError);
   </script>
 </body>
 </html>`;
 
 if (process.argv.includes("--ingest")) {
-  refresh().then(() => {
+  loadSamlSettings().then(() => refresh()).then(() => {
     console.log(JSON.stringify(stats(), null, 2));
   }).catch((error) => {
     console.error(error);
@@ -1418,6 +1878,7 @@ if (process.argv.includes("--ingest")) {
 } else {
   http.createServer(handler).listen(PORT, () => {
     console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
+    loadSamlSettings().catch(console.error);
     initMysql().catch((error) => {
       mysqlStatus = `unavailable: ${error.message}`;
       console.error(error);
