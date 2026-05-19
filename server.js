@@ -10,11 +10,10 @@ const { promisify } = require("node:util");
 const gunzip = promisify(zlib.gunzip);
 
 const PORT = Number(process.env.PORT || 3000);
-const BUCKET_URL = ensureTrailingSlash(process.env.S3_BUCKET_URL || "https://wc-openvpnlogs.s3.us-east-1.amazonaws.com/");
-const LOG_PREFIX = process.env.LOG_PREFIX || "CloudConnexa/wellesley/";
 const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
 const SETTINGS_DIR = process.env.SETTINGS_DIR || path.join(__dirname, "data", "settings");
 const SAML_SETTINGS_PATH = process.env.SAML_SETTINGS_PATH || path.join(SETTINGS_DIR, "saml.json");
+const SOURCE_SETTINGS_PATH = process.env.SOURCE_SETTINGS_PATH || path.join(SETTINGS_DIR, "source.json");
 const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 25));
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 72));
@@ -40,7 +39,60 @@ let refreshPromise = null;
 let mysqlPool = null;
 let mysqlStatus = MYSQL_ENABLED ? "not connected" : "disabled";
 let samlSettings = envSamlSettings();
+let sourceSettings = envSourceSettings();
 const sessions = new Map();
+
+function envSourceSettings() {
+  const bucketUrl = ensureTrailingSlash(process.env.S3_BUCKET_URL || "https://wc-openvpnlogs.s3.us-east-1.amazonaws.com/");
+  return cleanSourceSettings({
+    mode: process.env.S3_FETCH_MODE || process.env.LOG_SOURCE_MODE || "http",
+    bucketUrl,
+    bucketName: process.env.S3_BUCKET_NAME || bucketNameFromUrl(bucketUrl),
+    region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1",
+    logPrefix: process.env.LOG_PREFIX || "CloudConnexa/wellesley/"
+  });
+}
+
+async function loadSourceSettings() {
+  try {
+    const saved = JSON.parse(await fs.readFile(SOURCE_SETTINGS_PATH, "utf8"));
+    sourceSettings = { ...envSourceSettings(), ...cleanSourceSettings(saved) };
+  } catch (error) {
+    if (error.code !== "ENOENT") console.error(error);
+    sourceSettings = envSourceSettings();
+  }
+}
+
+async function saveSourceSettings(settings) {
+  const cleaned = cleanSourceSettings(settings);
+  await fs.mkdir(path.dirname(SOURCE_SETTINGS_PATH), { recursive: true });
+  await fs.writeFile(SOURCE_SETTINGS_PATH, JSON.stringify(cleaned, null, 2));
+  sourceSettings = { ...envSourceSettings(), ...cleaned };
+}
+
+function cleanSourceSettings(settings = {}) {
+  const bucketUrl = ensureTrailingSlash(String(settings.bucketUrl || "").trim());
+  const bucketName = String(settings.bucketName || bucketNameFromUrl(bucketUrl) || "").trim();
+  return {
+    mode: settings.mode === "s3-api" ? "s3-api" : "http",
+    bucketUrl,
+    bucketName,
+    region: String(settings.region || "us-east-1").trim() || "us-east-1",
+    logPrefix: String(settings.logPrefix || "").trim().replace(/^\/+/, "")
+  };
+}
+
+function publicSourceSettings() {
+  const settings = sourceConfig();
+  return {
+    ...settings,
+    hasIamCredentialEnv: Boolean(process.env.AWS_ACCESS_KEY_ID || process.env.AWS_PROFILE || process.env.AWS_WEB_IDENTITY_TOKEN_FILE || process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI)
+  };
+}
+
+function sourceConfig() {
+  return { ...envSourceSettings(), ...sourceSettings };
+}
 
 function envSamlSettings() {
   return {
@@ -63,7 +115,18 @@ function toBool(value) {
 }
 
 function ensureTrailingSlash(value) {
+  if (!value) return "";
   return value.endsWith("/") ? value : `${value}/`;
+}
+
+function bucketNameFromUrl(value) {
+  try {
+    const host = new URL(value).hostname;
+    const match = host.match(/^([^.]+)\.s3[.-]/);
+    return match ? match[1] : "";
+  } catch {
+    return "";
+  }
 }
 
 async function loadSamlSettings() {
@@ -280,14 +343,14 @@ function httpGetBufferOnce(url) {
   });
 }
 
-function parseS3List(xml) {
+function parseS3List(xml, logPrefix) {
   const objects = [];
   const contentRe = /<Contents>([\s\S]*?)<\/Contents>/g;
   let match;
   while ((match = contentRe.exec(xml))) {
     const block = match[1];
     const key = xmlText(block, "Key");
-    if (!key || !key.startsWith(LOG_PREFIX) || !key.endsWith(".jsonl.gz")) continue;
+    if (!key || !key.startsWith(logPrefix) || !key.endsWith(".jsonl.gz")) continue;
     objects.push({
       key,
       lastModified: xmlText(block, "LastModified"),
@@ -312,19 +375,72 @@ function decodeXml(value) {
     .replaceAll("&quot;", "\"");
 }
 
-async function listBucketObjects() {
+async function listBucketObjectsHttp(config) {
   const objects = [];
   let marker = "";
   for (;;) {
-    const pageUrl = marker ? `${BUCKET_URL}?marker=${encodeURIComponent(marker)}` : BUCKET_URL;
+    const pageUrl = marker ? `${config.bucketUrl}?marker=${encodeURIComponent(marker)}` : config.bucketUrl;
     const xml = (await httpGetBuffer(pageUrl)).toString("utf8");
-    const pageObjects = parseS3List(xml);
+    const pageObjects = parseS3List(xml, config.logPrefix);
     objects.push(...pageObjects);
     const isTruncated = xmlText(xml, "IsTruncated").toLowerCase() === "true";
     if (!isTruncated || pageObjects.length === 0) break;
     marker = pageObjects[pageObjects.length - 1].key;
   }
   return objects.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+async function s3Api() {
+  const sdk = require("@aws-sdk/client-s3");
+  return sdk;
+}
+
+async function s3Client(config) {
+  const { S3Client } = await s3Api();
+  return new S3Client({ region: config.region });
+}
+
+async function listBucketObjectsApi(config) {
+  if (!config.bucketName) throw new Error("S3 bucket name is required for S3 API mode.");
+  const { ListObjectsV2Command } = await s3Api();
+  const client = await s3Client(config);
+  const objects = [];
+  let ContinuationToken;
+  do {
+    const page = await client.send(new ListObjectsV2Command({
+      Bucket: config.bucketName,
+      Prefix: config.logPrefix,
+      ContinuationToken
+    }));
+    for (const object of page.Contents || []) {
+      if (!object.Key || !object.Key.endsWith(".jsonl.gz")) continue;
+      objects.push({
+        key: object.Key,
+        lastModified: object.LastModified ? object.LastModified.toISOString() : "",
+        size: Number(object.Size || 0),
+        etag: object.ETag || ""
+      });
+    }
+    ContinuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (ContinuationToken);
+  return objects.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+async function getObjectBufferApi(config, key, client) {
+  const { GetObjectCommand } = await s3Api();
+  const object = await client.send(new GetObjectCommand({ Bucket: config.bucketName, Key: key }));
+  return streamToBuffer(object.Body);
+}
+
+async function streamToBuffer(stream) {
+  if (!stream) return Buffer.alloc(0);
+  if (Buffer.isBuffer(stream)) return stream;
+  if (typeof stream.transformToByteArray === "function") {
+    return Buffer.from(await stream.transformToByteArray());
+  }
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
 async function walk(dir) {
@@ -453,15 +569,19 @@ async function parseObject(compressed, key) {
 }
 
 async function loadFromS3() {
-  const objects = await listBucketObjects();
+  const config = sourceConfig();
+  const apiMode = config.mode === "s3-api";
+  const objects = apiMode ? await listBucketObjectsApi(config) : await listBucketObjectsHttp(config);
+  const client = apiMode ? await s3Client(config) : null;
   const records = [];
   const failed = [];
   for (let index = 0; index < objects.length; index += FETCH_CONCURRENCY) {
     const batch = objects.slice(index, index + FETCH_CONCURRENCY);
     const batchRecords = await Promise.all(batch.map(async (object) => {
       try {
-        const url = BUCKET_URL + object.key.split("/").map(encodeURIComponent).join("/");
-        const compressed = await httpGetBuffer(url);
+        const compressed = apiMode
+          ? await getObjectBufferApi(config, object.key, client)
+          : await httpGetBuffer(config.bucketUrl + object.key.split("/").map(encodeURIComponent).join("/"));
         return parseObject(compressed, object.key);
       } catch (error) {
         failed.push(`${object.key}: ${error.message}`);
@@ -473,7 +593,7 @@ async function loadFromS3() {
   return {
     records,
     objects,
-    source: BUCKET_URL,
+    source: apiMode ? `s3://${config.bucketName}/${config.logPrefix}` : config.bucketUrl,
     error: failed.length ? `Skipped ${failed.length} S3 object(s) after retries. First error: ${failed[0]}` : null
   };
 }
@@ -1020,6 +1140,14 @@ async function handler(req, res) {
       await saveSamlSettings(nextSettings);
       return json(res, publicSamlSettings(req));
     }
+    if (url.pathname === "/api/settings/source" && req.method === "GET") return json(res, publicSourceSettings());
+    if (url.pathname === "/api/settings/source" && req.method === "POST") {
+      const nextSettings = cleanSourceSettings(await readJsonBody(req));
+      if (nextSettings.mode === "http" && !nextSettings.bucketUrl) return json(res, { error: "S3 bucket URL is required for HTTP mode." }, 400);
+      if (nextSettings.mode === "s3-api" && !nextSettings.bucketName) return json(res, { error: "S3 bucket name is required for S3 API mode." }, 400);
+      await saveSourceSettings(nextSettings);
+      return json(res, publicSourceSettings());
+    }
     if (url.pathname === "/api/stats") return json(res, stats(url.searchParams.get("timeZone") || "UTC"));
     if (url.pathname === "/api/facets") return json(res, facets());
     if (url.pathname === "/api/churn") {
@@ -1324,6 +1452,28 @@ const INDEX_HTML = `<!doctype html>
         </label>
       </section>
       <section class="settings-grid">
+        <h3 class="wide">Log Source</h3>
+        <label>Fetch mode
+          <select name="sourceMode">
+            <option value="http">HTTP bucket listing</option>
+            <option value="s3-api">S3 API with IAM credentials</option>
+          </select>
+        </label>
+        <label>AWS region
+          <input name="sourceRegion" autocomplete="off" placeholder="us-east-1">
+        </label>
+        <label class="wide">S3 bucket URL
+          <input name="sourceBucketUrl" autocomplete="off" placeholder="https://bucket.s3.us-east-1.amazonaws.com/">
+        </label>
+        <label>S3 bucket name
+          <input name="sourceBucketName" autocomplete="off" placeholder="bucket-name">
+        </label>
+        <label>Log prefix
+          <input name="sourceLogPrefix" autocomplete="off" placeholder="CloudConnexa/wellesley/">
+        </label>
+        <div class="muted wide" id="sourceCredentialStatus"></div>
+      </section>
+      <section class="settings-grid">
         <h3 class="wide">SAML 2.0 SSO</h3>
         <label class="check-row"><input type="checkbox" name="enabled"> Enable SAML login</label>
         <label class="check-row"><input type="checkbox" name="requireAuth"> Require SSO for API access</label>
@@ -1382,6 +1532,7 @@ const INDEX_HTML = `<!doctype html>
     const settingsDialog = document.querySelector("#settingsDialog");
     const settingsForm = document.querySelector("#settingsForm");
     const settingsTimeZone = document.querySelector("#settingsTimeZone");
+    const sourceCredentialStatus = document.querySelector("#sourceCredentialStatus");
     const closeSettings = document.querySelector("#closeSettings");
     const metadataUrl = document.querySelector("#metadataUrl");
     const IDLE_RELOAD_MS = 30 * 60 * 1000;
@@ -1536,6 +1687,15 @@ const INDEX_HTML = `<!doctype html>
 
     async function loadSettings() {
       fillTimeZoneSettings();
+      const source = await getJson("/api/settings/source");
+      settingsForm.elements.sourceMode.value = source.mode || "http";
+      settingsForm.elements.sourceBucketUrl.value = source.bucketUrl || "";
+      settingsForm.elements.sourceBucketName.value = source.bucketName || "";
+      settingsForm.elements.sourceRegion.value = source.region || "";
+      settingsForm.elements.sourceLogPrefix.value = source.logPrefix || "";
+      sourceCredentialStatus.textContent = source.mode === "s3-api"
+        ? (source.hasIamCredentialEnv ? "IAM credential environment detected." : "IAM credentials are read from the service environment or instance role.")
+        : "HTTP mode uses bucket policy access.";
       const saml = await getJson("/api/settings/saml");
       settingsForm.elements.enabled.checked = Boolean(saml.enabled);
       settingsForm.elements.requireAuth.checked = Boolean(saml.requireAuth);
@@ -1560,6 +1720,17 @@ const INDEX_HTML = `<!doctype html>
     async function saveSettings() {
       selectedTimeZone = validTimeZone(settingsTimeZone.value);
       localStorage.setItem(TIME_ZONE_STORAGE_KEY, selectedTimeZone);
+      await getJson("/api/settings/source", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: settingsForm.elements.sourceMode.value,
+          bucketUrl: settingsForm.elements.sourceBucketUrl.value,
+          bucketName: settingsForm.elements.sourceBucketName.value,
+          region: settingsForm.elements.sourceRegion.value,
+          logPrefix: settingsForm.elements.sourceLogPrefix.value
+        })
+      });
       await getJson("/api/settings/saml", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1906,7 +2077,7 @@ const INDEX_HTML = `<!doctype html>
 </html>`;
 
 if (process.argv.includes("--ingest")) {
-  loadSamlSettings().then(() => refresh()).then(() => {
+  Promise.all([loadSamlSettings(), loadSourceSettings()]).then(() => refresh()).then(() => {
     console.log(JSON.stringify(stats(), null, 2));
   }).catch((error) => {
     console.error(error);
@@ -1915,11 +2086,12 @@ if (process.argv.includes("--ingest")) {
 } else {
   http.createServer(handler).listen(PORT, () => {
     console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
-    loadSamlSettings().catch(console.error);
-    initMysql().catch((error) => {
-      mysqlStatus = `unavailable: ${error.message}`;
-      console.error(error);
-    }).finally(() => refresh().catch((error) => {
+    Promise.all([loadSamlSettings(), loadSourceSettings()]).then(() =>
+      initMysql().catch((error) => {
+        mysqlStatus = `unavailable: ${error.message}`;
+        console.error(error);
+      })
+    ).catch(console.error).finally(() => refresh().catch((error) => {
       store = { ...store, error: error.message };
       console.error(error);
     }));

@@ -1,11 +1,29 @@
 # OpenVPN Log Search
 
-Small, dependency-free web app for authorized CloudConnexa/OpenVPN audit logs stored as gzipped JSONL in S3.
+Small web app for authorized CloudConnexa/OpenVPN audit logs stored as gzipped JSONL in S3.
+
+The app is designed for operational log review, not long-term raw-log warehousing. It keeps the searchable log set in memory, optionally records aggregate connected-user counts in MySQL for licensing analysis, and avoids writing usernames, IPs, sessions, or raw event payloads to the database.
+
+## Features
+
+- Search all loaded log events, not only the currently displayed page.
+- Filter by category, event type, operating system, gateway, date range, and row limit.
+- Resize event-list columns; widths are remembered in browser storage.
+- View active users/sessions after excluding reconnect-heavy users from active-session counts.
+- Track connected users over time with week, month, and year ranges.
+- Show a compact Reconnect Watch for users with excessive connect/disconnect churn.
+- Click a Reconnect Watch username to put that user in the Search field and filter events.
+- Open Event Detail only when needed. Click an event to show details; click the same event again, or the X, to hide details and return the event list to full width.
+- Display timestamps in the timezone selected from `Menu` -> `Settings`.
+- Configure optional SAML 2.0 SSO from environment variables or `Menu` -> `Settings`.
+- Choose HTTP bucket listing or S3 API with IAM credentials from `Menu` -> `Settings`.
+- Redact secret-like keys in raw event display.
 
 ## Run
 
 ```powershell
-node server.js
+npm install
+npm start
 ```
 
 Then open `http://localhost:3000`.
@@ -15,7 +33,7 @@ Node.js 18 or newer is required for SAML 2.0 SSO support.
 You can also verify ingestion without starting the web server:
 
 ```powershell
-node server.js --ingest
+npm run ingest
 ```
 
 By default the app reads from:
@@ -30,11 +48,20 @@ If the current machine cannot list the bucket, run it on `ospf1` or place `.json
 
 ```text
 PORT=3000
-S3_BUCKET_URL=https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
-LOG_PREFIX=CloudConnexa/wellesley/
 RAW_DIR=data/raw
+SETTINGS_DIR=data/settings
+SAML_SETTINGS_PATH=data/settings/saml.json
+SOURCE_SETTINGS_PATH=data/settings/source.json
+FETCH_CONCURRENCY=25
 AUTO_REFRESH_MINUTES=30
 ACTIVE_SESSION_MAX_AGE_HOURS=72
+
+# Log source.
+S3_FETCH_MODE=http
+S3_BUCKET_URL=https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
+S3_BUCKET_NAME=<BUCKET-NAME>
+AWS_REGION=us-east-1
+LOG_PREFIX=CloudConnexa/wellesley/
 
 # Optional MySQL aggregate count storage.
 MYSQL_HOST=127.0.0.1
@@ -51,6 +78,10 @@ SAML_CALLBACK_URL=https://logs.example.edu/auth/saml/callback
 SAML_ENTRY_POINT=https://idp.example.edu/sso/saml
 SAML_LOGOUT_URL=https://idp.example.edu/slo/saml
 SAML_IDP_CERT=<idp signing certificate>
+SAML_AUDIENCE=
+SAML_WANT_ASSERTIONS_SIGNED=true
+SAML_WANT_RESPONSE_SIGNED=false
+SAML_DISABLE_REQUESTED_AUTHN_CONTEXT=true
 ```
 
 When MySQL is configured, the app stores only aggregate licensing telemetry:
@@ -62,7 +93,55 @@ When MySQL is configured, the app stores only aggregate licensing telemetry:
 The `connected_user_counts` table contains only those three columns.
 No usernames, IPs, session IDs, raw logs, or event payloads are written to MySQL. Samples older than 365 days are deleted automatically.
 
-SAML settings can also be managed in the app from `Account` -> `Settings`. The app exposes SP metadata at `/auth/saml/metadata` after SAML is configured.
+SAML settings can also be managed in the app from `Menu` -> `Settings`. The app exposes SP metadata at `/auth/saml/metadata` after SAML is configured.
+
+## Log Source Settings
+
+The setup menu supports two S3 fetch modes:
+
+- `HTTP bucket listing` uses `S3_BUCKET_URL` and bucket policy/source-IP access.
+- `S3 API with IAM credentials` uses `S3_BUCKET_NAME`, `AWS_REGION`, and the standard AWS SDK credential chain.
+
+AWS secrets are not stored by the setup menu. If you use S3 API mode outside AWS, put credentials in the service environment file, for example:
+
+```bash
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+```
+
+If the app runs on EC2, prefer an instance role instead of access keys. The role or IAM user only needs `s3:ListBucket` for the bucket and `s3:GetObject` for the CloudConnexa log prefix.
+
+Changing the log source in `Menu` -> `Settings` saves `data/settings/source.json`. Use Reload, restart the service, or wait for the next refresh to load from the new source.
+
+## Interface Notes
+
+The main screen is split into a compact dashboard, filters, and the event list:
+
+- `Active users` shows active users and sessions after excluding reconnect-heavy users and ignoring stale sessions older than `ACTIVE_SESSION_MAX_AGE_HOURS`.
+- `Connected Users Over Time` shows aggregate connected-user counts. If MySQL is configured it reads the retained one-year count history; otherwise it derives the visible series from the loaded logs.
+- `Reconnect Watch` shows the highest churn users in the last 24 hours. Each username is clickable and runs an event search for that user.
+- The event table uses the full available width until an event is selected.
+- Selecting an event opens the Event Detail pane. Selecting the same event again closes it.
+- Event Detail includes normalized fields, a per-user reconnect summary, and redacted raw JSON.
+
+Use `Menu` -> `Settings` for timezone and SAML configuration. The timezone selection affects displayed timestamps in the dashboard, table, and detail pane.
+
+## Aggregate Count Storage
+
+MySQL is optional. When configured, it creates and maintains:
+
+```sql
+CREATE TABLE IF NOT EXISTS connected_user_counts (
+  sampled_at DATETIME NOT NULL PRIMARY KEY,
+  connected_users INT NOT NULL,
+  excluded_users INT NOT NULL
+);
+```
+
+The app samples connected-user counts after log refreshes and deletes samples older than 365 days. This is intended for license-sizing trend analysis only.
+
+The table does not contain usernames, IP addresses, device IDs, session IDs, raw logs, or event payloads.
 
 ## S3 Bucket Access
 
@@ -144,7 +223,9 @@ Security note: IP-based bucket policies are useful for a small internal tool, bu
 ## Notes
 
 - The app keeps logs in memory for fast filtering.
-- Search checks common fields and raw JSON.
+- Search checks normalized fields and raw JSON across the full loaded log set.
 - Connection logs are normalized into user, device, public IP, tunnel IP, OS, gateway, protocol, session ID, duration, transfer volume, and disconnect reason.
+- The event list displays normalized operational fields and can be searched by username, IP, device, operation, gateway, trace ID, and other common fields.
 - Display redacts secret-like keys such as `token`, `secret`, `password`, and `privateKey`.
 - It does not redact ordinary operational fields such as username, email, timestamp, and IP address because those are the point of the admin search workflow.
+- Log refresh can be triggered with the Reload button, the `/api/reload` endpoint, or automatically after the configured idle period.
