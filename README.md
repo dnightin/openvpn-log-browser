@@ -17,6 +17,7 @@ The app is designed for operational log review, not long-term raw-log warehousin
 - Display timestamps in the timezone selected from `Menu` -> `Settings`.
 - Configure optional SAML 2.0 SSO from environment variables or `Menu` -> `Settings`.
 - Choose HTTP bucket listing or S3 API with IAM credentials from `Menu` -> `Settings`.
+- Reload S3 logs incrementally by reusing unchanged objects while the server process stays running.
 - Redact secret-like keys in raw event display.
 
 ## Run
@@ -52,7 +53,7 @@ RAW_DIR=data/raw
 SETTINGS_DIR=data/settings
 SAML_SETTINGS_PATH=data/settings/saml.json
 SOURCE_SETTINGS_PATH=data/settings/source.json
-FETCH_CONCURRENCY=25
+FETCH_CONCURRENCY=32
 AUTO_REFRESH_MINUTES=30
 ACTIVE_SESSION_MAX_AGE_HOURS=72
 
@@ -113,6 +114,22 @@ AWS_REGION=us-east-1
 If the app runs on EC2, prefer an instance role instead of access keys. The role or IAM user only needs `s3:ListBucket` for the bucket and `s3:GetObject` for the CloudConnexa log prefix.
 
 Changing the log source in `Menu` -> `Settings` saves `data/settings/source.json`. Use Reload, restart the service, or wait for the next refresh to load from the new source.
+
+## Refresh Behavior
+
+The app refreshes logs in three ways:
+
+- Click `Reload` in the UI.
+- POST to `/api/reload`.
+- Let the automatic 30-minute refresh run.
+
+`AUTO_REFRESH_MINUTES` controls both the server background refresh interval and the browser idle refresh timer. The default is `30`. Set it to `0` to disable automatic refreshes.
+
+For S3 sources, reloads are incremental while the server process stays running. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads/parses only new or changed objects. Unchanged objects reuse their in-memory parsed records.
+
+After a service restart, the in-memory object cache is empty, so the first load still has to rebuild from S3. Cold loads process newest S3 objects first so the dashboard shows recent activity while older logs continue loading.
+
+`FETCH_CONCURRENCY` controls how many new or changed S3 objects are downloaded in parallel. The default is `32`. Increase it only if the VM has spare CPU and memory; lower it if Node uses too much CPU or RSS during a cold load.
 
 ## Interface Notes
 
@@ -223,9 +240,10 @@ Security note: IP-based bucket policies are useful for a small internal tool, bu
 ## Notes
 
 - The app keeps logs in memory for fast filtering.
+- S3 reloads keep a per-object parsed-record cache in memory and reuse unchanged objects until the server restarts.
 - Search checks normalized fields and raw JSON across the full loaded log set.
 - Connection logs are normalized into user, device, public IP, tunnel IP, OS, gateway, protocol, session ID, duration, transfer volume, and disconnect reason.
 - The event list displays normalized operational fields and can be searched by username, IP, device, operation, gateway, trace ID, and other common fields.
 - Display redacts secret-like keys such as `token`, `secret`, `password`, and `privateKey`.
 - It does not redact ordinary operational fields such as username, email, timestamp, and IP address because those are the point of the admin search workflow.
-- Log refresh can be triggered with the Reload button, the `/api/reload` endpoint, or automatically after the configured idle period.
+- Log refresh can be triggered with the Reload button, the `/api/reload` endpoint, the server refresh interval, or the browser idle refresh timer.
