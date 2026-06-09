@@ -11,12 +11,15 @@ const gunzip = promisify(zlib.gunzip);
 
 const PORT = Number(process.env.PORT || 3000);
 const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
+const S3_CACHE_DIR = process.env.S3_CACHE_DIR || path.join(__dirname, "data", "s3-cache");
+const S3_CACHE_OBJECT_DIR = path.join(S3_CACHE_DIR, "objects");
+const S3_CACHE_MANIFEST_PATH = path.join(S3_CACHE_DIR, "manifest.json");
 const SETTINGS_DIR = process.env.SETTINGS_DIR || path.join(__dirname, "data", "settings");
 const SAML_SETTINGS_PATH = process.env.SAML_SETTINGS_PATH || path.join(SETTINGS_DIR, "saml.json");
 const SOURCE_SETTINGS_PATH = process.env.SOURCE_SETTINGS_PATH || path.join(SETTINGS_DIR, "source.json");
 const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 32));
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
-const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 72));
+const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 6));
 const SESSION_COOKIE = "openvpn_log_browser_session";
 const MYSQL_ENABLED = Boolean(process.env.MYSQL_HOST || process.env.MYSQL_USER || process.env.MYSQL_DATABASE);
 const MYSQL_CONFIG = {
@@ -590,11 +593,15 @@ async function loadFromS3() {
   }
   const objects = apiMode ? await listBucketObjectsApi(config) : await listBucketObjectsHttp(config);
   const client = apiMode ? await s3Client(config) : null;
+  const manifest = await loadS3CacheManifest(sourceId);
   const records = [];
   const failed = [];
   const pending = [];
   const seenKeys = new Set();
-  let reused = 0;
+  let reusedMemory = 0;
+  let reusedDisk = 0;
+  let downloaded = 0;
+  let batchesSinceManifestSave = 0;
 
   for (const object of objects) {
     seenKeys.add(object.key);
@@ -602,7 +609,7 @@ async function loadFromS3() {
     const cached = objectRecordCache.get(object.key);
     if (cached && cached.fingerprint === fingerprint) {
       records.push(...cached.records);
-      reused += 1;
+      reusedMemory += 1;
     } else {
       pending.push({ ...object, fingerprint });
     }
@@ -611,15 +618,25 @@ async function loadFromS3() {
   for (const key of objectRecordCache.keys()) {
     if (!seenKeys.has(key)) objectRecordCache.delete(key);
   }
+  for (const key of Object.keys(manifest.objects)) {
+    if (!seenKeys.has(key)) delete manifest.objects[key];
+  }
 
   for (let index = 0; index < pending.length; index += FETCH_CONCURRENCY) {
     const batch = pending.slice(index, index + FETCH_CONCURRENCY);
     const batchRecords = await Promise.all(batch.map(async (object) => {
       const cached = objectRecordCache.get(object.key);
       try {
-        const compressed = apiMode
-          ? await getObjectBufferApi(config, object.key, client)
-          : await httpGetBuffer(config.bucketUrl + object.key.split("/").map(encodeURIComponent).join("/"));
+        let compressed = await readCachedS3Object(manifest, object);
+        if (compressed) {
+          reusedDisk += 1;
+        } else {
+          compressed = apiMode
+            ? await getObjectBufferApi(config, object.key, client)
+            : await httpGetBuffer(config.bucketUrl + object.key.split("/").map(encodeURIComponent).join("/"));
+          await writeCachedS3Object(manifest, object, compressed);
+          downloaded += 1;
+        }
         const parsed = await parseObject(compressed, object.key);
         objectRecordCache.set(object.key, { fingerprint: object.fingerprint, records: parsed });
         return parsed;
@@ -638,10 +655,16 @@ async function loadFromS3() {
       records,
       source: apiMode ? `s3://${config.bucketName}/${config.logPrefix}` : config.bucketUrl,
       objects,
-      error: `Loading S3 objects ${Math.min(index + batch.length, pending.length)} of ${pending.length} new/changed; reused ${reused} unchanged.`
+      error: `Loading S3 objects ${Math.min(index + batch.length, pending.length)} of ${pending.length} not in memory; memory ${reusedMemory}, disk ${reusedDisk}, downloaded ${downloaded}.`
     };
+    batchesSinceManifestSave += 1;
+    if (batchesSinceManifestSave >= 25) {
+      await saveS3CacheManifest(manifest, seenKeys);
+      batchesSinceManifestSave = 0;
+    }
     await yieldToEventLoop();
   }
+  await saveS3CacheManifest(manifest, seenKeys);
   return {
     records,
     objects,
@@ -656,6 +679,65 @@ function sourceCacheId(config) {
 
 function objectFingerprint(object) {
   return [object.etag || "", object.size || 0, object.lastModified || ""].join("|");
+}
+
+async function loadS3CacheManifest(sourceId) {
+  try {
+    const manifest = JSON.parse(await fs.readFile(S3_CACHE_MANIFEST_PATH, "utf8"));
+    if (manifest.sourceId !== sourceId || !manifest.objects || typeof manifest.objects !== "object") {
+      return { version: 1, sourceId, objects: {} };
+    }
+    return manifest;
+  } catch (error) {
+    if (error.code !== "ENOENT") console.error(error);
+    return { version: 1, sourceId, objects: {} };
+  }
+}
+
+async function saveS3CacheManifest(manifest, seenKeys) {
+  for (const key of Object.keys(manifest.objects)) {
+    if (!seenKeys.has(key)) delete manifest.objects[key];
+  }
+  await fs.mkdir(S3_CACHE_DIR, { recursive: true });
+  await fs.writeFile(S3_CACHE_MANIFEST_PATH, JSON.stringify({
+    version: 1,
+    sourceId: manifest.sourceId,
+    updatedAt: new Date().toISOString(),
+    objects: manifest.objects
+  }, null, 2));
+}
+
+async function readCachedS3Object(manifest, object) {
+  const entry = manifest.objects[object.key];
+  if (!entry || entry.fingerprint !== object.fingerprint) return null;
+  try {
+    return await fs.readFile(cachePathForS3Key(object.key));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    delete manifest.objects[object.key];
+    return null;
+  }
+}
+
+async function writeCachedS3Object(manifest, object, compressed) {
+  const filePath = cachePathForS3Key(object.key);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await fs.writeFile(tempPath, compressed);
+  await fs.rename(tempPath, filePath);
+  manifest.objects[object.key] = {
+    fingerprint: object.fingerprint,
+    size: object.size,
+    etag: object.etag,
+    lastModified: object.lastModified,
+    path: path.relative(S3_CACHE_DIR, filePath).replaceAll(path.sep, "/"),
+    cachedAt: new Date().toISOString()
+  };
+}
+
+function cachePathForS3Key(key) {
+  const parts = key.split("/").filter(Boolean).map((part) => encodeURIComponent(part));
+  return path.join(S3_CACHE_OBJECT_DIR, ...parts);
 }
 
 function yieldToEventLoop() {
@@ -982,20 +1064,39 @@ function newestRecordTimestamp() {
 function connectedUsersSnapshot() {
   const newest = newestRecordTimestamp();
   const cutoff = newest - (24 * 60 * 60 * 1000);
-  const staleCutoff = newest - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
   const excludedUsers = excessiveReconnectUsers(newest, cutoff);
-  const activeUsers = new Set();
-  for (const session of connectionSessions()) {
-    if (excludedUsers.has(session.userName)) continue;
-    if (!session.end && session.start < staleCutoff) continue;
-    const end = session.end || newest + 1;
-    if (session.start <= newest && end > newest) activeUsers.add(session.userName);
-  }
+  const activeRows = latestActiveConnections(newest).filter((session) => !excludedUsers.has(session.userName));
+  const activeUsers = new Set(activeRows.map((session) => session.userName));
   return {
     connectedUsers: activeUsers.size,
     excludedUsers: excludedUsers.size,
     generatedAt: new Date(newest).toISOString()
   };
+}
+
+function latestActiveConnections(atTime = newestRecordTimestamp()) {
+  const staleCutoff = atTime - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
+  const latestByUser = new Map();
+  for (const record of store.records) {
+    if (record.eventName !== "client-connected" && record.eventName !== "client-disconnected") continue;
+    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    if (!userName) continue;
+    const timestamp = Date.parse(record.timestamp);
+    if (!Number.isFinite(timestamp) || timestamp > atTime) continue;
+    const previous = latestByUser.get(userName);
+    const disconnectedWinsTie = previous && timestamp === previous.timestamp && record.eventName === "client-disconnected";
+    if (!previous || timestamp > previous.timestamp || disconnectedWinsTie) {
+      latestByUser.set(userName, {
+        sessionId: record.sessionId || "",
+        userName,
+        eventName: record.eventName,
+        timestamp
+      });
+    }
+  }
+  return [...latestByUser.values()].filter((session) =>
+    session.eventName === "client-connected" && session.timestamp >= staleCutoff
+  );
 }
 
 async function connectedUsersSeries(range = "week") {
@@ -1119,12 +1220,7 @@ function stats(timeZone = "UTC") {
     totalBytesOut += record.bytesOut || 0;
   }
   const newest = timestamps.length ? Date.parse(timestamps[timestamps.length - 1]) : Date.now();
-  const staleCutoff = newest - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
-  const activeSessionRows = connectionSessions().filter((session) => {
-    if (!session.end && session.start < staleCutoff) return false;
-    const end = session.end || newest + 1;
-    return session.start <= newest && end > newest;
-  });
+  const activeSessionRows = latestActiveConnections(newest);
   const activeSessions = activeSessionRows.length;
   const activeUsers = unique(activeSessionRows.map((session) => session.userName)).length;
   return {

@@ -50,12 +50,13 @@ If the current machine cannot list the bucket, run it on `ospf1` or place `.json
 ```text
 PORT=3000
 RAW_DIR=data/raw
+S3_CACHE_DIR=data/s3-cache
 SETTINGS_DIR=data/settings
 SAML_SETTINGS_PATH=data/settings/saml.json
 SOURCE_SETTINGS_PATH=data/settings/source.json
 FETCH_CONCURRENCY=32
 AUTO_REFRESH_MINUTES=30
-ACTIVE_SESSION_MAX_AGE_HOURS=72
+ACTIVE_SESSION_MAX_AGE_HOURS=6
 
 # Log source.
 S3_FETCH_MODE=http
@@ -125,9 +126,11 @@ The app refreshes logs in three ways:
 
 `AUTO_REFRESH_MINUTES` controls both the server background refresh interval and the browser idle refresh timer. The default is `30`. Set it to `0` to disable automatic refreshes.
 
-For S3 sources, reloads are incremental while the server process stays running. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads/parses only new or changed objects. Unchanged objects reuse their in-memory parsed records.
+For S3 sources, reloads are incremental. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads only new or changed objects. Unchanged objects reuse their in-memory parsed records while the server stays running, or the local S3 object cache after a restart.
 
-After a service restart, the in-memory object cache is empty, so the first load still has to rebuild from S3. Cold loads process newest S3 objects first so the dashboard shows recent activity while older logs continue loading.
+The local S3 object cache is stored under `S3_CACHE_DIR`, which defaults to `data/s3-cache` inside the app directory. The cache stores gzipped log objects and `manifest.json`; protect this directory like VPN logs. It is ignored by Git.
+
+After a service restart, the in-memory parsed cache is empty, so the first load parses from the local S3 object cache where possible and only downloads objects missing from disk or changed in S3. Cold loads process newest S3 objects first so the dashboard shows recent activity while older logs continue loading.
 
 `FETCH_CONCURRENCY` controls how many new or changed S3 objects are downloaded in parallel. The default is `32`. Increase it only if the VM has spare CPU and memory; lower it if Node uses too much CPU or RSS during a cold load.
 
@@ -135,7 +138,7 @@ After a service restart, the in-memory object cache is empty, so the first load 
 
 The main screen is split into a compact dashboard, filters, and the event list:
 
-- `Active users` shows active users and sessions after excluding reconnect-heavy users and ignoring stale sessions older than `ACTIVE_SESSION_MAX_AGE_HOURS`.
+- `Active users` shows users and sessions whose latest connection-state event is connected and newer than `ACTIVE_SESSION_MAX_AGE_HOURS`.
 - `Connected Users Over Time` shows aggregate connected-user counts. If MySQL is configured it reads the retained one-year count history; otherwise it derives the visible series from the loaded logs.
 - `Reconnect Watch` shows the highest churn users in the last 24 hours. Each username is clickable and runs an event search for that user.
 - The event table uses the full available width until an event is selected.
@@ -240,7 +243,7 @@ Security note: IP-based bucket policies are useful for a small internal tool, bu
 ## Notes
 
 - The app keeps logs in memory for fast filtering.
-- S3 reloads keep a per-object parsed-record cache in memory and reuse unchanged objects until the server restarts.
+- S3 reloads keep a per-object parsed-record cache in memory and a gzipped object cache under `data/s3-cache`.
 - Search checks normalized fields and raw JSON across the full loaded log set.
 - Connection logs are normalized into user, device, public IP, tunnel IP, OS, gateway, protocol, session ID, duration, transfer volume, and disconnect reason.
 - The event list displays normalized operational fields and can be searched by username, IP, device, operation, gateway, trace ID, and other common fields.
