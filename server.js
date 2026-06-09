@@ -14,7 +14,7 @@ const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
 const SETTINGS_DIR = process.env.SETTINGS_DIR || path.join(__dirname, "data", "settings");
 const SAML_SETTINGS_PATH = process.env.SAML_SETTINGS_PATH || path.join(SETTINGS_DIR, "saml.json");
 const SOURCE_SETTINGS_PATH = process.env.SOURCE_SETTINGS_PATH || path.join(SETTINGS_DIR, "source.json");
-const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 25));
+const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 32));
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 72));
 const SESSION_COOKIE = "openvpn_log_browser_session";
@@ -39,7 +39,9 @@ let refreshPromise = null;
 let mysqlPool = null;
 let mysqlStatus = MYSQL_ENABLED ? "not connected" : "disabled";
 let samlSettings = envSamlSettings();
-let sourceSettings = envSourceSettings();
+let sourceSettings = null;
+let objectRecordCache = new Map();
+let objectRecordCacheSource = "";
 const sessions = new Map();
 
 function envSourceSettings() {
@@ -91,7 +93,7 @@ function publicSourceSettings() {
 }
 
 function sourceConfig() {
-  return { ...envSourceSettings(), ...sourceSettings };
+  return sourceSettings || envSourceSettings();
 }
 
 function envSamlSettings() {
@@ -361,6 +363,16 @@ function parseS3List(xml, logPrefix) {
   return objects.sort((a, b) => a.key.localeCompare(b.key));
 }
 
+function sortS3Objects(objects) {
+  return objects.sort((a, b) => {
+    const aTime = Date.parse(a.lastModified);
+    const bTime = Date.parse(b.lastModified);
+    if (Number.isFinite(aTime) && Number.isFinite(bTime) && aTime !== bTime) return bTime - aTime;
+    if (Number.isFinite(aTime) !== Number.isFinite(bTime)) return Number.isFinite(bTime) ? 1 : -1;
+    return b.key.localeCompare(a.key);
+  });
+}
+
 function xmlText(block, tag) {
   const match = block.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`));
   return match ? decodeXml(match[1]) : "";
@@ -387,7 +399,7 @@ async function listBucketObjectsHttp(config) {
     if (!isTruncated || pageObjects.length === 0) break;
     marker = pageObjects[pageObjects.length - 1].key;
   }
-  return objects.sort((a, b) => a.key.localeCompare(b.key));
+  return sortS3Objects(objects);
 }
 
 async function s3Api() {
@@ -423,7 +435,7 @@ async function listBucketObjectsApi(config) {
     }
     ContinuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
   } while (ContinuationToken);
-  return objects.sort((a, b) => a.key.localeCompare(b.key));
+  return sortS3Objects(objects);
 }
 
 async function getObjectBufferApi(config, key, client) {
@@ -571,24 +583,64 @@ async function parseObject(compressed, key) {
 async function loadFromS3() {
   const config = sourceConfig();
   const apiMode = config.mode === "s3-api";
+  const sourceId = sourceCacheId(config);
+  if (objectRecordCacheSource !== sourceId) {
+    objectRecordCache = new Map();
+    objectRecordCacheSource = sourceId;
+  }
   const objects = apiMode ? await listBucketObjectsApi(config) : await listBucketObjectsHttp(config);
   const client = apiMode ? await s3Client(config) : null;
   const records = [];
   const failed = [];
-  for (let index = 0; index < objects.length; index += FETCH_CONCURRENCY) {
-    const batch = objects.slice(index, index + FETCH_CONCURRENCY);
+  const pending = [];
+  const seenKeys = new Set();
+  let reused = 0;
+
+  for (const object of objects) {
+    seenKeys.add(object.key);
+    const fingerprint = objectFingerprint(object);
+    const cached = objectRecordCache.get(object.key);
+    if (cached && cached.fingerprint === fingerprint) {
+      records.push(...cached.records);
+      reused += 1;
+    } else {
+      pending.push({ ...object, fingerprint });
+    }
+  }
+
+  for (const key of objectRecordCache.keys()) {
+    if (!seenKeys.has(key)) objectRecordCache.delete(key);
+  }
+
+  for (let index = 0; index < pending.length; index += FETCH_CONCURRENCY) {
+    const batch = pending.slice(index, index + FETCH_CONCURRENCY);
     const batchRecords = await Promise.all(batch.map(async (object) => {
+      const cached = objectRecordCache.get(object.key);
       try {
         const compressed = apiMode
           ? await getObjectBufferApi(config, object.key, client)
           : await httpGetBuffer(config.bucketUrl + object.key.split("/").map(encodeURIComponent).join("/"));
-        return parseObject(compressed, object.key);
+        const parsed = await parseObject(compressed, object.key);
+        objectRecordCache.set(object.key, { fingerprint: object.fingerprint, records: parsed });
+        return parsed;
       } catch (error) {
+        if (cached) {
+          failed.push(`${object.key}: ${error.message}; used cached records`);
+          return cached.records;
+        }
         failed.push(`${object.key}: ${error.message}`);
         return [];
       }
     }));
     for (const objectRecords of batchRecords) records.push(...objectRecords);
+    store = {
+      ...store,
+      records,
+      source: apiMode ? `s3://${config.bucketName}/${config.logPrefix}` : config.bucketUrl,
+      objects,
+      error: `Loading S3 objects ${Math.min(index + batch.length, pending.length)} of ${pending.length} new/changed; reused ${reused} unchanged.`
+    };
+    await yieldToEventLoop();
   }
   return {
     records,
@@ -596,6 +648,18 @@ async function loadFromS3() {
     source: apiMode ? `s3://${config.bucketName}/${config.logPrefix}` : config.bucketUrl,
     error: failed.length ? `Skipped ${failed.length} S3 object(s) after retries. First error: ${failed[0]}` : null
   };
+}
+
+function sourceCacheId(config) {
+  return [config.mode, config.bucketUrl, config.bucketName, config.region, config.logPrefix].join("|");
+}
+
+function objectFingerprint(object) {
+  return [object.etag || "", object.size || 0, object.lastModified || ""].join("|");
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 async function loadFromRawDir() {
@@ -744,8 +808,7 @@ function userChurnSummary(userName) {
   }
 
   const windowHours = 24;
-  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
-  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const newest = newestRecordTimestamp();
   const cutoff = newest - (windowHours * 60 * 60 * 1000);
   const userRecords = store.records.filter((record) => {
     if ((record.userName || record.parentEntityName || record.initiatorName) !== userName) return false;
@@ -794,8 +857,7 @@ function userChurnSummary(userName) {
 
 function churnLeaderboard(limit = 10) {
   const windowHours = 24;
-  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
-  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const newest = newestRecordTimestamp();
   const cutoff = newest - (windowHours * 60 * 60 * 1000);
   const users = new Map();
   const connectedSeconds = connectedSecondsByUser(newest, cutoff);
@@ -908,9 +970,17 @@ function connectedSecondsByUser(newest, cutoff) {
   return byUser;
 }
 
+function newestRecordTimestamp() {
+  let newest = 0;
+  for (const record of store.records) {
+    const ts = Date.parse(record.timestamp);
+    if (Number.isFinite(ts) && ts > newest) newest = ts;
+  }
+  return newest || Date.now();
+}
+
 function connectedUsersSnapshot() {
-  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
-  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const newest = newestRecordTimestamp();
   const cutoff = newest - (24 * 60 * 60 * 1000);
   const staleCutoff = newest - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
   const excludedUsers = excessiveReconnectUsers(newest, cutoff);
@@ -970,8 +1040,7 @@ function inMemoryConnectedUsersSeries(range = "week") {
     year: { windowHours: 24 * 365, stepMinutes: 1440 }
   }[range] || { windowHours: 24 * 7, stepMinutes: 120 };
   const { windowHours, stepMinutes } = rangeConfig;
-  const timestamps = store.records.map((record) => Date.parse(record.timestamp)).filter(Number.isFinite);
-  const newest = timestamps.length ? Math.max(...timestamps) : Date.now();
+  const newest = newestRecordTimestamp();
   const start = newest - (windowHours * 60 * 60 * 1000);
   const stepMs = stepMinutes * 60 * 1000;
   const excludedUsers = excessiveReconnectUsers(newest, newest - (24 * 60 * 60 * 1000));
