@@ -18,6 +18,7 @@ const SETTINGS_DIR = process.env.SETTINGS_DIR || path.join(__dirname, "data", "s
 const SAML_SETTINGS_PATH = process.env.SAML_SETTINGS_PATH || path.join(SETTINGS_DIR, "saml.json");
 const SOURCE_SETTINGS_PATH = process.env.SOURCE_SETTINGS_PATH || path.join(SETTINGS_DIR, "source.json");
 const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 32));
+const LOAD_BATCH_DELAY_MS = Math.max(0, Number(process.env.LOAD_BATCH_DELAY_MS || 0));
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 6));
 const SESSION_COOKIE = "openvpn_log_browser_session";
@@ -662,7 +663,7 @@ async function loadFromS3() {
       await saveS3CacheManifest(manifest, seenKeys);
       batchesSinceManifestSave = 0;
     }
-    await yieldToEventLoop();
+    await yieldToEventLoop(LOAD_BATCH_DELAY_MS);
   }
   await saveS3CacheManifest(manifest, seenKeys);
   return {
@@ -709,9 +710,21 @@ async function saveS3CacheManifest(manifest, seenKeys) {
 
 async function readCachedS3Object(manifest, object) {
   const entry = manifest.objects[object.key];
-  if (!entry || entry.fingerprint !== object.fingerprint) return null;
+  const filePath = cachePathForS3Key(object.key);
+  if (!entry || entry.fingerprint !== object.fingerprint) {
+    try {
+      const stat = await fs.stat(filePath);
+      if (Number(object.size || 0) && stat.size !== Number(object.size || 0)) return null;
+      const compressed = await fs.readFile(filePath);
+      manifest.objects[object.key] = cacheManifestEntry(object, filePath);
+      return compressed;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      return null;
+    }
+  }
   try {
-    return await fs.readFile(cachePathForS3Key(object.key));
+    return await fs.readFile(filePath);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     delete manifest.objects[object.key];
@@ -725,7 +738,11 @@ async function writeCachedS3Object(manifest, object, compressed) {
   const tempPath = `${filePath}.${process.pid}.tmp`;
   await fs.writeFile(tempPath, compressed);
   await fs.rename(tempPath, filePath);
-  manifest.objects[object.key] = {
+  manifest.objects[object.key] = cacheManifestEntry(object, filePath);
+}
+
+function cacheManifestEntry(object, filePath) {
+  return {
     fingerprint: object.fingerprint,
     size: object.size,
     etag: object.etag,
@@ -740,7 +757,8 @@ function cachePathForS3Key(key) {
   return path.join(S3_CACHE_OBJECT_DIR, ...parts);
 }
 
-function yieldToEventLoop() {
+function yieldToEventLoop(delayMs = 0) {
+  if (delayMs > 0) return new Promise((resolve) => setTimeout(resolve, delayMs));
   return new Promise((resolve) => setImmediate(resolve));
 }
 
