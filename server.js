@@ -936,6 +936,16 @@ async function ensureMysqlLogIndexes() {
   if (!await mysqlIndexExists("log_s3_objects", "last_modified_idx")) {
     await ignoreMysqlIndexError(() => mysqlPool.query("ALTER TABLE log_s3_objects ADD KEY last_modified_idx (last_modified)"));
   }
+  await ensureMysqlIndex("log_events", "source_time_idx", "ALTER TABLE log_events ADD KEY source_time_idx (source_hash, timestamp_dt)");
+  await ensureMysqlIndex("log_events", "source_event_time_idx", "ALTER TABLE log_events ADD KEY source_event_time_idx (source_hash, event_name, timestamp_dt)");
+  await ensureMysqlIndex("log_events", "source_user_time_idx", "ALTER TABLE log_events ADD KEY source_user_time_idx (source_hash, user_name, timestamp_dt)");
+  await ensureMysqlIndex("log_events", "source_category_time_idx", "ALTER TABLE log_events ADD KEY source_category_time_idx (source_hash, category, timestamp_dt)");
+}
+
+async function ensureMysqlIndex(tableName, indexName, statement) {
+  if (!await mysqlIndexExists(tableName, indexName)) {
+    await ignoreMysqlIndexError(() => mysqlPool.query(statement));
+  }
 }
 
 async function mysqlIndexExists(tableName, indexName) {
@@ -1252,12 +1262,13 @@ function mysqlRowToRecord(row) {
 }
 
 function mysqlRecordSelect(includeRaw = false) {
+  const includeSearch = includeRaw;
   return `SELECT id, source_key, line_number, timestamp_text, date_text, category, event_name,
                  initiator, initiator_name, user_name, device_name, initiator_type, public_ip,
                  operation_name, entity_type, entity_name, parent_entity_name, session_id,
                  protocol_name, gateway, gateway_region, os, tunnel_ip, tunnel_ip_v4, tunnel_ip_v6,
                  session_start_time, session_end_time, duration_seconds, bytes_in, bytes_out,
-                 disconnect_reason, trace_id, user_agent, search_text${includeRaw ? ", raw_json" : ""}
+                 disconnect_reason, trace_id, user_agent${includeSearch ? ", search_text" : ""}${includeRaw ? ", raw_json" : ""}
           FROM log_events`;
 }
 
@@ -1297,12 +1308,24 @@ function mysqlSearchWhere(params, sourceHash) {
     values.push(`%${gateway}%`);
   }
   if (start) {
-    where.push("timestamp_text >= ?");
-    values.push(start);
+    const startDate = mysqlDateOrNull(start);
+    if (startDate) {
+      where.push("timestamp_dt >= ?");
+      values.push(startDate);
+    } else {
+      where.push("timestamp_text >= ?");
+      values.push(start);
+    }
   }
   if (end) {
-    where.push("timestamp_text <= ?");
-    values.push(end);
+    const endDate = mysqlDateOrNull(end);
+    if (endDate) {
+      where.push("timestamp_dt <= ?");
+      values.push(endDate);
+    } else {
+      where.push("timestamp_text <= ?");
+      values.push(end);
+    }
   }
   return { sql: where.join(" AND "), values };
 }
@@ -1319,7 +1342,7 @@ async function filterRecordsFromMysql(params) {
   const sourceHash = currentSourceHash();
   const limit = Math.min(Number(params.get("limit") || 1000), 10000);
   const { sql, values } = mysqlSearchWhere(params, sourceHash);
-  const [[searchedRow]] = await mysqlPool.execute("SELECT COUNT(*) AS count FROM log_events WHERE source_hash = ?", [sourceHash]);
+  const searched = await mysqlIndexedRecordCount(sourceHash);
   const [[totalRow]] = await mysqlPool.execute(`SELECT COUNT(*) AS count FROM log_events WHERE ${sql}`, values);
   const [rows] = await mysqlPool.execute(
     `${mysqlRecordSelect(false)}
@@ -1329,11 +1352,21 @@ async function filterRecordsFromMysql(params) {
     [...values, limit]
   );
   return {
-    searched: Number(searchedRow.count || 0),
+    searched,
     total: Number(totalRow.count || 0),
     limit,
     rows: rows.map(mysqlRowToRecord)
   };
+}
+
+async function mysqlIndexedRecordCount(sourceHash) {
+  const [cacheRows] = await mysqlPool.execute(
+    "SELECT records FROM log_stats_cache WHERE source_hash = ? LIMIT 1",
+    [sourceHash]
+  );
+  if (cacheRows.length) return Number(cacheRows[0].records || 0);
+  const [[row]] = await mysqlPool.execute("SELECT COUNT(*) AS count FROM log_events WHERE source_hash = ?", [sourceHash]);
+  return Number(row.count || 0);
 }
 
 async function facetsFromMysql() {

@@ -101,6 +101,8 @@ When the parsed log index is available, search, stats, facets, record detail, an
 
 The parsed log index includes a MariaDB full-text index on `search_text` for keyword searches.
 
+Common event-list filters use composite MariaDB indexes on source, timestamp, event name, username, and category. Search results return lean list rows; raw JSON and other detail-only data are loaded from `/api/record` only after an event is selected.
+
 The worker updates `log_stats_cache` and `active_sessions_snapshot` after each ingest. This keeps the dashboard and reload button from recomputing large event aggregates during normal UI use.
 
 The aggregate count history is stored in `connected_user_counts`. Samples older than 365 days are deleted automatically.
