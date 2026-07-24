@@ -42,6 +42,7 @@ let store = {
 let refreshPromise = null;
 let mysqlPool = null;
 let mysqlStatus = MYSQL_ENABLED ? "not connected" : "disabled";
+let mysqlLogIndexReady = false;
 let samlSettings = envSamlSettings();
 let sourceSettings = null;
 let objectRecordCache = new Map();
@@ -588,6 +589,7 @@ async function loadFromS3() {
   const config = sourceConfig();
   const apiMode = config.mode === "s3-api";
   const sourceId = sourceCacheId(config);
+  const sourceHash = hashId(sourceId);
   if (objectRecordCacheSource !== sourceId) {
     objectRecordCache = new Map();
     objectRecordCacheSource = sourceId;
@@ -595,12 +597,14 @@ async function loadFromS3() {
   const objects = apiMode ? await listBucketObjectsApi(config) : await listBucketObjectsHttp(config);
   const client = apiMode ? await s3Client(config) : null;
   const manifest = await loadS3CacheManifest(sourceId);
+  const mysqlIndex = await mysqlIndexedObjects(sourceHash);
   const records = [];
   const failed = [];
   const pending = [];
   const seenKeys = new Set();
   let reusedMemory = 0;
   let reusedDisk = 0;
+  let reusedMysql = 0;
   let downloaded = 0;
   let batchesSinceManifestSave = 0;
 
@@ -609,8 +613,10 @@ async function loadFromS3() {
     const fingerprint = objectFingerprint(object);
     const cached = objectRecordCache.get(object.key);
     if (cached && cached.fingerprint === fingerprint) {
-      records.push(...cached.records);
+      if (!mysqlIndex) records.push(...cached.records);
       reusedMemory += 1;
+    } else if (mysqlIndex && mysqlIndex.get(object.key) === fingerprint) {
+      reusedMysql += 1;
     } else {
       pending.push({ ...object, fingerprint });
     }
@@ -622,10 +628,11 @@ async function loadFromS3() {
   for (const key of Object.keys(manifest.objects)) {
     if (!seenKeys.has(key)) delete manifest.objects[key];
   }
+  pending.sort((a, b) => cachePriority(manifest, b) - cachePriority(manifest, a));
 
   for (let index = 0; index < pending.length; index += FETCH_CONCURRENCY) {
     const batch = pending.slice(index, index + FETCH_CONCURRENCY);
-    const batchRecords = await Promise.all(batch.map(async (object) => {
+    const batchResults = await Promise.all(batch.map(async (object) => {
       const cached = objectRecordCache.get(object.key);
       try {
         let compressed = await readCachedS3Object(manifest, object);
@@ -640,23 +647,26 @@ async function loadFromS3() {
         }
         const parsed = await parseObject(compressed, object.key);
         objectRecordCache.set(object.key, { fingerprint: object.fingerprint, records: parsed });
-        return parsed;
+        return { object, records: parsed, indexable: true };
       } catch (error) {
         if (cached) {
           failed.push(`${object.key}: ${error.message}; used cached records`);
-          return cached.records;
+          return { object, records: cached.records, indexable: false };
         }
         failed.push(`${object.key}: ${error.message}`);
-        return [];
+        return { object, records: [], indexable: false };
       }
     }));
-    for (const objectRecords of batchRecords) records.push(...objectRecords);
+    await saveParsedObjectsToMysql(sourceId, sourceHash, batchResults.filter((result) => result.indexable));
+    if (!mysqlIndex) {
+      for (const result of batchResults) records.push(...result.records);
+    }
     store = {
       ...store,
       records,
       source: apiMode ? `s3://${config.bucketName}/${config.logPrefix}` : config.bucketUrl,
       objects,
-      error: `Loading S3 objects ${Math.min(index + batch.length, pending.length)} of ${pending.length} not in memory; memory ${reusedMemory}, disk ${reusedDisk}, downloaded ${downloaded}.`
+      error: `Loading S3 objects ${Math.min(index + batch.length, pending.length)} of ${pending.length} not indexed; mysql ${reusedMysql}, memory ${reusedMemory}, disk ${reusedDisk}, downloaded ${downloaded}.`
     };
     batchesSinceManifestSave += 1;
     if (batchesSinceManifestSave >= 25) {
@@ -680,6 +690,12 @@ function sourceCacheId(config) {
 
 function objectFingerprint(object) {
   return [object.etag || "", object.size || 0, object.lastModified || ""].join("|");
+}
+
+function cachePriority(manifest, object) {
+  const entry = manifest.objects[object.key];
+  if (!entry) return 0;
+  return entry.fingerprint === object.fingerprint ? 2 : 1;
 }
 
 async function loadS3CacheManifest(sourceId) {
@@ -795,13 +811,90 @@ async function initMysql() {
       excluded_users INT UNSIGNED NOT NULL
     )
   `);
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS log_s3_objects (
+      source_hash CHAR(64) NOT NULL,
+      object_hash CHAR(64) NOT NULL,
+      source_id TEXT NOT NULL,
+      object_key TEXT NOT NULL,
+      fingerprint VARCHAR(255) NOT NULL,
+      etag VARCHAR(128) NOT NULL DEFAULT '',
+      size BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      last_modified DATETIME NULL,
+      parsed_at DATETIME NOT NULL,
+      record_count INT UNSIGNED NOT NULL DEFAULT 0,
+      PRIMARY KEY (source_hash, object_hash),
+      KEY parsed_at_idx (parsed_at)
+    )
+  `);
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS log_events (
+      id_hash CHAR(64) NOT NULL PRIMARY KEY,
+      source_hash CHAR(64) NOT NULL,
+      object_hash CHAR(64) NOT NULL,
+      id TEXT NOT NULL,
+      source_key TEXT NOT NULL,
+      line_number INT UNSIGNED NOT NULL,
+      timestamp_dt DATETIME NULL,
+      timestamp_text VARCHAR(64) NOT NULL DEFAULT '',
+      date_text VARCHAR(16) NOT NULL DEFAULT '',
+      category VARCHAR(128) NOT NULL DEFAULT '',
+      event_name VARCHAR(128) NOT NULL DEFAULT '',
+      initiator VARCHAR(255) NOT NULL DEFAULT '',
+      initiator_name VARCHAR(255) NOT NULL DEFAULT '',
+      user_name VARCHAR(255) NOT NULL DEFAULT '',
+      device_name VARCHAR(255) NOT NULL DEFAULT '',
+      initiator_type VARCHAR(128) NOT NULL DEFAULT '',
+      public_ip VARCHAR(128) NOT NULL DEFAULT '',
+      operation_name VARCHAR(128) NOT NULL DEFAULT '',
+      entity_type VARCHAR(128) NOT NULL DEFAULT '',
+      entity_name VARCHAR(255) NOT NULL DEFAULT '',
+      parent_entity_name VARCHAR(255) NOT NULL DEFAULT '',
+      session_id VARCHAR(128) NOT NULL DEFAULT '',
+      protocol_name VARCHAR(128) NOT NULL DEFAULT '',
+      gateway VARCHAR(255) NOT NULL DEFAULT '',
+      gateway_region VARCHAR(128) NOT NULL DEFAULT '',
+      os VARCHAR(255) NOT NULL DEFAULT '',
+      tunnel_ip VARCHAR(255) NOT NULL DEFAULT '',
+      tunnel_ip_v4 VARCHAR(128) NOT NULL DEFAULT '',
+      tunnel_ip_v6 VARCHAR(128) NOT NULL DEFAULT '',
+      session_start_time VARCHAR(64) NOT NULL DEFAULT '',
+      session_end_time VARCHAR(64) NOT NULL DEFAULT '',
+      duration_seconds INT UNSIGNED NOT NULL DEFAULT 0,
+      bytes_in BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      bytes_out BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      disconnect_reason VARCHAR(255) NOT NULL DEFAULT '',
+      trace_id VARCHAR(128) NOT NULL DEFAULT '',
+      user_agent TEXT NOT NULL,
+      search_text LONGTEXT NOT NULL,
+      raw_json LONGTEXT NOT NULL,
+      KEY source_object_idx (source_hash, object_hash),
+      KEY timestamp_idx (timestamp_dt),
+      KEY event_idx (event_name),
+      KEY category_idx (category),
+      KEY user_idx (user_name),
+      KEY public_ip_idx (public_ip),
+      KEY session_idx (session_id)
+    )
+  `);
+  mysqlLogIndexReady = true;
+  const sourceHash = hashId(sourceCacheId(sourceConfig()));
+  const indexedObjects = await loadIndexedObjectsFromMysql(sourceHash);
+  store = {
+    ...store,
+    records: [],
+    objects: indexedObjects,
+    source: indexedObjects.length ? "MariaDB log index" : store.source,
+    loadedAt: indexedObjects.length ? new Date().toISOString() : store.loadedAt,
+    error: indexedObjects.length ? null : store.error
+  };
   mysqlStatus = "connected";
 }
 
 async function saveConnectedCountSample() {
-  if (!mysqlPool || !store.records.length) return;
+  if (!mysqlPool) return;
   try {
-    const snapshot = connectedUsersSnapshot();
+    const snapshot = mysqlLogIndexReady ? await connectedUsersSnapshotFromMysql() : connectedUsersSnapshot();
     const sampledAt = mysqlDate(new Date());
     await mysqlPool.execute(
       `INSERT INTO connected_user_counts (sampled_at, connected_users, excluded_users)
@@ -819,6 +912,504 @@ async function saveConnectedCountSample() {
 
 function mysqlDate(date) {
   return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function mysqlDateOrNull(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : mysqlDate(date);
+}
+
+function hashId(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function currentSourceHash() {
+  return hashId(sourceCacheId(sourceConfig()));
+}
+
+function mysqlLogIndexAvailable() {
+  return Boolean(mysqlPool && mysqlLogIndexReady);
+}
+
+async function mysqlIndexedObjects(sourceHash) {
+  if (!mysqlPool || !mysqlLogIndexReady) return null;
+  const [rows] = await mysqlPool.execute(
+    "SELECT object_key, fingerprint FROM log_s3_objects WHERE source_hash = ?",
+    [sourceHash]
+  );
+  return new Map(rows.map((row) => [row.object_key, row.fingerprint]));
+}
+
+async function saveParsedObjectToMysql(sourceId, sourceHash, object, records) {
+  return saveParsedObjectsToMysql(sourceId, sourceHash, [{ object, records }]);
+}
+
+async function saveParsedObjectsToMysql(sourceId, sourceHash, parsedObjects) {
+  if (!mysqlPool || !mysqlLogIndexReady) return;
+  const indexable = parsedObjects.filter((item) => item && item.object);
+  if (!indexable.length) return;
+  const connection = await mysqlPool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const objectHashes = indexable.map((item) => hashId(item.object.key));
+    await connection.query(
+      `DELETE FROM log_events WHERE source_hash = ? AND object_hash IN (${objectHashes.map(() => "?").join(",")})`,
+      [sourceHash, ...objectHashes]
+    );
+
+    const columns = [
+      "id_hash", "source_hash", "object_hash", "id", "source_key", "line_number", "timestamp_dt", "timestamp_text",
+      "date_text", "category", "event_name", "initiator", "initiator_name", "user_name", "device_name",
+      "initiator_type", "public_ip", "operation_name", "entity_type", "entity_name", "parent_entity_name",
+      "session_id", "protocol_name", "gateway", "gateway_region", "os", "tunnel_ip", "tunnel_ip_v4", "tunnel_ip_v6",
+      "session_start_time", "session_end_time", "duration_seconds", "bytes_in", "bytes_out", "disconnect_reason",
+      "trace_id", "user_agent", "search_text", "raw_json"
+    ];
+    const eventRows = [];
+    for (let itemIndex = 0; itemIndex < indexable.length; itemIndex += 1) {
+      const item = indexable[itemIndex];
+      const objectHash = objectHashes[itemIndex];
+      for (const record of item.records || []) eventRows.push(recordToMysqlValues(sourceHash, objectHash, record));
+    }
+    if (eventRows.length) {
+      for (let index = 0; index < eventRows.length; index += 500) {
+        const batch = eventRows.slice(index, index + 500);
+        const placeholders = batch.map(() => `(${columns.map(() => "?").join(",")})`).join(",");
+        await connection.query(
+          `INSERT INTO log_events (${columns.join(",")}) VALUES ${placeholders}`,
+          batch.flat()
+        );
+      }
+    }
+
+    const objectRows = indexable.map((item, index) => {
+      const object = item.object;
+      return [
+        sourceHash,
+        objectHashes[index],
+        sourceId,
+        object.key,
+        object.fingerprint,
+        object.etag || "",
+        Number(object.size || 0),
+        mysqlDateOrNull(object.lastModified),
+        (item.records || []).length
+      ];
+    });
+    const objectPlaceholders = objectRows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?)").join(",");
+    await connection.query(
+      `INSERT INTO log_s3_objects
+       (source_hash, object_hash, source_id, object_key, fingerprint, etag, size, last_modified, parsed_at, record_count)
+       VALUES ${objectPlaceholders}
+       ON DUPLICATE KEY UPDATE
+         source_id = VALUES(source_id),
+         object_key = VALUES(object_key),
+         fingerprint = VALUES(fingerprint),
+         etag = VALUES(etag),
+         size = VALUES(size),
+         last_modified = VALUES(last_modified),
+         parsed_at = VALUES(parsed_at),
+         record_count = VALUES(record_count)`,
+      objectRows.flat()
+    );
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+function recordToMysqlValues(sourceHash, objectHash, record) {
+  return [
+    hashId(record.id),
+    sourceHash,
+    objectHash,
+    record.id,
+    record.sourceKey,
+    Number(record.lineNumber || 0),
+    mysqlDateOrNull(record.timestamp),
+    record.timestamp || "",
+    record.date || "",
+    record.category || "",
+    record.eventName || "",
+    record.initiator || "",
+    record.initiatorName || "",
+    record.userName || "",
+    record.deviceName || "",
+    record.initiatorType || "",
+    record.publicIp || "",
+    record.operation || "",
+    record.entityType || "",
+    record.entityName || "",
+    record.parentEntityName || "",
+    record.sessionId || "",
+    record.protocol || "",
+    record.gateway || "",
+    record.gatewayRegion || "",
+    record.os || "",
+    record.tunnelIp || "",
+    record.tunnelIpV4 || "",
+    record.tunnelIpV6 || "",
+    record.sessionStartTime || "",
+    record.sessionEndTime || "",
+    Number(record.durationSeconds || 0),
+    Number(record.bytesIn || 0),
+    Number(record.bytesOut || 0),
+    record.disconnectReason || "",
+    record.traceId || "",
+    record.userAgent || "",
+    record.searchText || "",
+    JSON.stringify(record.raw || {})
+  ];
+}
+
+async function loadEventsFromMysql(sourceHash) {
+  if (!mysqlPool || !mysqlLogIndexReady) return [];
+  const [rows] = await mysqlPool.execute(
+    `SELECT id, source_key, line_number, timestamp_text, date_text, category, event_name,
+            initiator, initiator_name, user_name, device_name, initiator_type, public_ip,
+            operation_name, entity_type, entity_name, parent_entity_name, session_id,
+            protocol_name, gateway, gateway_region, os, tunnel_ip, tunnel_ip_v4, tunnel_ip_v6,
+            session_start_time, session_end_time, duration_seconds, bytes_in, bytes_out,
+            disconnect_reason, trace_id, user_agent, search_text
+     FROM log_events
+     WHERE source_hash = ?
+     ORDER BY timestamp_dt DESC, id_hash DESC`,
+    [sourceHash]
+  );
+  return rows.map(mysqlRowToRecord);
+}
+
+async function loadRecordRawFromMysql(sourceHash, id) {
+  if (!mysqlPool || !mysqlLogIndexReady) return null;
+  const [rows] = await mysqlPool.execute(
+    "SELECT raw_json FROM log_events WHERE source_hash = ? AND id_hash = ? LIMIT 1",
+    [sourceHash, hashId(id)]
+  );
+  if (!rows.length) return null;
+  try {
+    return JSON.parse(rows[0].raw_json || "{}");
+  } catch {
+    return { parseError: "Stored raw JSON could not be parsed." };
+  }
+}
+
+async function loadIndexedObjectsFromMysql(sourceHash) {
+  if (!mysqlPool || !mysqlLogIndexReady) return [];
+  const [rows] = await mysqlPool.execute(
+    `SELECT object_key, size, last_modified, etag
+     FROM log_s3_objects
+     WHERE source_hash = ?
+     ORDER BY last_modified DESC, object_key DESC`,
+    [sourceHash]
+  );
+  return rows.map((row) => ({
+    key: row.object_key,
+    size: Number(row.size || 0),
+    lastModified: row.last_modified ? new Date(row.last_modified).toISOString() : "",
+    etag: row.etag || ""
+  }));
+}
+
+function mysqlRowToRecord(row) {
+  let raw = {};
+  if (row.raw_json) {
+    try {
+      raw = JSON.parse(row.raw_json || "{}");
+    } catch {
+      raw = { parseError: "Stored raw JSON could not be parsed." };
+    }
+  }
+  return {
+    id: row.id,
+    sourceKey: row.source_key,
+    lineNumber: Number(row.line_number || 0),
+    timestamp: row.timestamp_text || "",
+    date: row.date_text || "",
+    category: row.category || "",
+    eventName: row.event_name || "",
+    initiator: row.initiator || "",
+    initiatorName: row.initiator_name || "",
+    userName: row.user_name || "",
+    deviceName: row.device_name || "",
+    initiatorType: row.initiator_type || "",
+    publicIp: row.public_ip || "",
+    operation: row.operation_name || "",
+    entityType: row.entity_type || "",
+    entityName: row.entity_name || "",
+    parentEntityName: row.parent_entity_name || "",
+    sessionId: row.session_id || "",
+    protocol: row.protocol_name || "",
+    gateway: row.gateway || "",
+    gatewayRegion: row.gateway_region || "",
+    os: row.os || "",
+    tunnelIp: row.tunnel_ip || "",
+    tunnelIpV4: row.tunnel_ip_v4 || "",
+    tunnelIpV6: row.tunnel_ip_v6 || "",
+    sessionStartTime: row.session_start_time || "",
+    sessionEndTime: row.session_end_time || "",
+    durationSeconds: Number(row.duration_seconds || 0),
+    bytesIn: Number(row.bytes_in || 0),
+    bytesOut: Number(row.bytes_out || 0),
+    disconnectReason: row.disconnect_reason || "",
+    traceId: row.trace_id || "",
+    userAgent: row.user_agent || "",
+    raw,
+    searchText: row.search_text || ""
+  };
+}
+
+function mysqlRecordSelect(includeRaw = false) {
+  return `SELECT id, source_key, line_number, timestamp_text, date_text, category, event_name,
+                 initiator, initiator_name, user_name, device_name, initiator_type, public_ip,
+                 operation_name, entity_type, entity_name, parent_entity_name, session_id,
+                 protocol_name, gateway, gateway_region, os, tunnel_ip, tunnel_ip_v4, tunnel_ip_v6,
+                 session_start_time, session_end_time, duration_seconds, bytes_in, bytes_out,
+                 disconnect_reason, trace_id, user_agent, search_text${includeRaw ? ", raw_json" : ""}
+          FROM log_events`;
+}
+
+function mysqlSearchWhere(params, sourceHash) {
+  const where = ["source_hash = ?"];
+  const values = [sourceHash];
+  const q = (params.get("q") || "").trim().toLowerCase();
+  const category = params.get("category") || "";
+  const eventName = params.get("eventName") || "";
+  const os = params.get("os") || "";
+  const gateway = params.get("gateway") || "";
+  const start = params.get("start") || "";
+  const end = params.get("end") || "";
+  if (q) {
+    where.push("search_text LIKE ?");
+    values.push(`%${q}%`);
+  }
+  if (category) {
+    where.push("category = ?");
+    values.push(category);
+  }
+  if (eventName) {
+    where.push("event_name = ?");
+    values.push(eventName);
+  }
+  if (os) {
+    where.push("os LIKE ?");
+    values.push(`${os}%`);
+  }
+  if (gateway) {
+    where.push("gateway LIKE ?");
+    values.push(`%${gateway}%`);
+  }
+  if (start) {
+    where.push("timestamp_text >= ?");
+    values.push(start);
+  }
+  if (end) {
+    where.push("timestamp_text <= ?");
+    values.push(end);
+  }
+  return { sql: where.join(" AND "), values };
+}
+
+async function filterRecordsFromMysql(params) {
+  const sourceHash = currentSourceHash();
+  const limit = Math.min(Number(params.get("limit") || 1000), 10000);
+  const { sql, values } = mysqlSearchWhere(params, sourceHash);
+  const [[searchedRow]] = await mysqlPool.execute("SELECT COUNT(*) AS count FROM log_events WHERE source_hash = ?", [sourceHash]);
+  const [[totalRow]] = await mysqlPool.execute(`SELECT COUNT(*) AS count FROM log_events WHERE ${sql}`, values);
+  const [rows] = await mysqlPool.execute(
+    `${mysqlRecordSelect(false)}
+     WHERE ${sql}
+     ORDER BY timestamp_dt DESC, id_hash DESC
+     LIMIT ?`,
+    [...values, limit]
+  );
+  return {
+    searched: Number(searchedRow.count || 0),
+    total: Number(totalRow.count || 0),
+    limit,
+    rows: rows.map(mysqlRowToRecord)
+  };
+}
+
+async function facetsFromMysql() {
+  const sourceHash = currentSourceHash();
+  const distinct = async (column, suffix = "") => {
+    const [rows] = await mysqlPool.execute(
+      `SELECT DISTINCT ${column} AS value FROM log_events WHERE source_hash = ? AND ${column} <> '' ORDER BY ${column} LIMIT 250`,
+      [sourceHash]
+    );
+    const values = rows.map((row) => String(row.value || ""));
+    return suffix ? unique(values.map((value) => value.split(suffix)[0])) : values;
+  };
+  return {
+    categories: await distinct("category"),
+    eventNames: await distinct("event_name"),
+    operatingSystems: await distinct("os", " "),
+    gateways: await distinct("gateway"),
+    users: (await distinct("user_name")).slice(0, 25),
+    ips: (await distinct("public_ip")).slice(0, 25)
+  };
+}
+
+async function recordFromMysql(id) {
+  const [rows] = await mysqlPool.execute(
+    `${mysqlRecordSelect(true)} WHERE source_hash = ? AND id_hash = ? LIMIT 1`,
+    [currentSourceHash(), hashId(id)]
+  );
+  return rows.length ? mysqlRowToRecord(rows[0]) : null;
+}
+
+async function statsFromMysql(timeZone = "UTC") {
+  const sourceHash = currentSourceHash();
+  const displayTimeZone = normalizeTimeZone(timeZone);
+  const [[summary]] = await mysqlPool.execute(
+    `SELECT COUNT(*) AS records,
+            MIN(timestamp_text) AS firstTimestamp,
+            MAX(timestamp_text) AS lastTimestamp,
+            COALESCE(SUM(bytes_in), 0) AS totalBytesIn,
+            COALESCE(SUM(bytes_out), 0) AS totalBytesOut
+     FROM log_events
+     WHERE source_hash = ?`,
+    [sourceHash]
+  );
+  const [[objectsRow]] = await mysqlPool.execute(
+    "SELECT COUNT(*) AS objects FROM log_s3_objects WHERE source_hash = ?",
+    [sourceHash]
+  );
+  const [eventRows] = await mysqlPool.execute(
+    "SELECT event_name, COUNT(*) AS count FROM log_events WHERE source_hash = ? AND event_name <> '' GROUP BY event_name",
+    [sourceHash]
+  );
+  const [dayRows] = await mysqlPool.execute(
+    "SELECT date_text, COUNT(*) AS count FROM log_events WHERE source_hash = ? AND date_text <> '' GROUP BY date_text ORDER BY date_text",
+    [sourceHash]
+  );
+  const newest = summary.lastTimestamp ? Date.parse(summary.lastTimestamp) : Date.now();
+  const activeRows = await latestActiveConnectionsFromMysql(newest);
+  return {
+    records: Number(summary.records || 0),
+    objects: Number(objectsRow.objects || store.objects.length || 0),
+    activeSessions: activeRows.length,
+    activeUsers: unique(activeRows.map((session) => session.userName)).length,
+    mysql: mysqlStatus,
+    byEvent: Object.fromEntries(eventRows.map((row) => [row.event_name, Number(row.count || 0)])),
+    totalBytesIn: Number(summary.totalBytesIn || 0),
+    totalBytesOut: Number(summary.totalBytesOut || 0),
+    source: store.source,
+    loadedAt: store.loadedAt,
+    error: store.error,
+    loading: Boolean(refreshPromise),
+    firstTimestamp: summary.firstTimestamp || "",
+    lastTimestamp: summary.lastTimestamp || "",
+    timeZone: displayTimeZone,
+    byDay: Object.fromEntries(dayRows.map((row) => [row.date_text, Number(row.count || 0)]))
+  };
+}
+
+async function connectionRecordsFromMysqlSince(cutoff) {
+  const [rows] = await mysqlPool.execute(
+    `${mysqlRecordSelect(false)}
+     WHERE source_hash = ?
+       AND event_name IN ('client-connected', 'client-disconnected')
+       AND timestamp_dt >= ?
+     ORDER BY timestamp_dt ASC, id_hash ASC`,
+    [currentSourceHash(), mysqlDate(new Date(cutoff))]
+  );
+  return rows.map(mysqlRowToRecord);
+}
+
+async function latestActiveConnectionsFromMysql(atTime = Date.now()) {
+  const staleCutoff = atTime - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
+  const records = await connectionRecordsFromMysqlSince(staleCutoff);
+  const latestByUser = new Map();
+  for (const record of records) {
+    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    if (!userName) continue;
+    const timestamp = Date.parse(record.timestamp);
+    if (!Number.isFinite(timestamp) || timestamp > atTime) continue;
+    const previous = latestByUser.get(userName);
+    const disconnectedWinsTie = previous && timestamp === previous.timestamp && record.eventName === "client-disconnected";
+    if (!previous || timestamp > previous.timestamp || disconnectedWinsTie) {
+      latestByUser.set(userName, {
+        sessionId: record.sessionId || "",
+        userName,
+        eventName: record.eventName,
+        timestamp
+      });
+    }
+  }
+  return [...latestByUser.values()].filter((session) => session.eventName === "client-connected" && session.timestamp >= staleCutoff);
+}
+
+async function connectedUsersSnapshotFromMysql() {
+  const [[row]] = await mysqlPool.execute(
+    "SELECT MAX(timestamp_text) AS newest FROM log_events WHERE source_hash = ?",
+    [currentSourceHash()]
+  );
+  const newest = row.newest ? Date.parse(row.newest) : Date.now();
+  const cutoff = newest - (24 * 60 * 60 * 1000);
+  const excludedUsers = await excessiveReconnectUsersFromMysql(newest, cutoff);
+  const activeRows = (await latestActiveConnectionsFromMysql(newest)).filter((session) => !excludedUsers.has(session.userName));
+  return {
+    connectedUsers: new Set(activeRows.map((session) => session.userName)).size,
+    excludedUsers: excludedUsers.size,
+    generatedAt: new Date(newest).toISOString()
+  };
+}
+
+async function excessiveReconnectUsersFromMysql(newest, cutoff) {
+  const records = await connectionRecordsFromMysqlSince(cutoff);
+  const previousRecords = store.records;
+  store.records = records;
+  try {
+    return excessiveReconnectUsers(newest, cutoff);
+  } finally {
+    store.records = previousRecords;
+  }
+}
+
+async function churnLeaderboardFromMysql(limit = 10) {
+  const [[row]] = await mysqlPool.execute(
+    "SELECT MAX(timestamp_text) AS newest FROM log_events WHERE source_hash = ?",
+    [currentSourceHash()]
+  );
+  const newest = row.newest ? Date.parse(row.newest) : Date.now();
+  const cutoff = newest - (24 * 60 * 60 * 1000);
+  const records = await connectionRecordsFromMysqlSince(cutoff);
+  const previousRecords = store.records;
+  store.records = records;
+  try {
+    return churnLeaderboard(limit);
+  } finally {
+    store.records = previousRecords;
+  }
+}
+
+async function userChurnSummaryFromMysql(userName) {
+  if (!userName) return userChurnSummary(userName);
+  const [[row]] = await mysqlPool.execute(
+    "SELECT MAX(timestamp_text) AS newest FROM log_events WHERE source_hash = ?",
+    [currentSourceHash()]
+  );
+  const newest = row.newest ? Date.parse(row.newest) : Date.now();
+  const cutoff = newest - (24 * 60 * 60 * 1000);
+  const [rows] = await mysqlPool.execute(
+    `${mysqlRecordSelect(false)}
+     WHERE source_hash = ?
+       AND timestamp_dt >= ?
+       AND (user_name = ? OR parent_entity_name = ? OR initiator_name = ?)
+     ORDER BY timestamp_dt DESC, id_hash DESC`,
+    [currentSourceHash(), mysqlDate(new Date(cutoff)), userName, userName, userName]
+  );
+  const previousRecords = store.records;
+  store.records = rows.map(mysqlRowToRecord);
+  try {
+    return userChurnSummary(userName);
+  } finally {
+    store.records = previousRecords;
+  }
 }
 
 async function refresh() {
@@ -1331,15 +1922,15 @@ async function handler(req, res) {
       await saveSourceSettings(nextSettings);
       return json(res, publicSourceSettings());
     }
-    if (url.pathname === "/api/stats") return json(res, stats(url.searchParams.get("timeZone") || "UTC"));
-    if (url.pathname === "/api/facets") return json(res, facets());
+    if (url.pathname === "/api/stats") return json(res, mysqlLogIndexAvailable() ? await statsFromMysql(url.searchParams.get("timeZone") || "UTC") : stats(url.searchParams.get("timeZone") || "UTC"));
+    if (url.pathname === "/api/facets") return json(res, mysqlLogIndexAvailable() ? await facetsFromMysql() : facets());
     if (url.pathname === "/api/churn") {
       const limit = Math.min(Number(url.searchParams.get("limit") || 10), 50);
-      return json(res, churnLeaderboard(limit));
+      return json(res, mysqlLogIndexAvailable() ? await churnLeaderboardFromMysql(limit) : churnLeaderboard(limit));
     }
     if (url.pathname === "/api/connected-users") return json(res, await connectedUsersSeries(url.searchParams.get("range") || "week"));
     if (url.pathname === "/api/search") {
-      const result = filterRecords(url.searchParams);
+      const result = mysqlLogIndexAvailable() ? await filterRecordsFromMysql(url.searchParams) : filterRecords(url.searchParams);
       return json(res, {
         ...result,
         rows: result.rows.map(({ searchText, raw, ...record }) => record)
@@ -1347,16 +1938,19 @@ async function handler(req, res) {
     }
     if (url.pathname === "/api/record") {
       const id = url.searchParams.get("id");
-      const record = store.records.find((item) => item.id === id);
+      const record = mysqlLogIndexAvailable() ? await recordFromMysql(id) : store.records.find((item) => item.id === id);
       if (!record) return notFound(res);
-      return json(res, { ...record, searchText: undefined, raw: redact(record.raw), churn: userChurnSummary(record.userName || record.parentEntityName || record.initiatorName) });
+      const raw = record.raw && Object.keys(record.raw).length ? record.raw : await loadRecordRawFromMysql(currentSourceHash(), id) || {};
+      const userName = record.userName || record.parentEntityName || record.initiatorName;
+      const churn = mysqlLogIndexAvailable() ? await userChurnSummaryFromMysql(userName) : userChurnSummary(userName);
+      return json(res, { ...record, searchText: undefined, raw: redact(raw), churn });
     }
     if (url.pathname === "/api/reload" && req.method === "POST") {
       refresh().catch((error) => {
         store = { ...store, error: error.message };
         console.error(error);
       });
-      return json(res, stats());
+      return json(res, mysqlLogIndexAvailable() ? await statsFromMysql() : stats());
     }
     return notFound(res);
   } catch (error) {
@@ -2260,8 +2854,8 @@ const INDEX_HTML = `<!doctype html>
 </html>`;
 
 if (process.argv.includes("--ingest")) {
-  Promise.all([loadSamlSettings(), loadSourceSettings()]).then(() => refresh()).then(() => {
-    console.log(JSON.stringify(stats(), null, 2));
+  Promise.all([loadSamlSettings(), loadSourceSettings()]).then(() => initMysql()).then(() => refresh()).then(async () => {
+    console.log(JSON.stringify(mysqlLogIndexAvailable() ? await statsFromMysql() : stats(), null, 2));
   }).catch((error) => {
     console.error(error);
     process.exit(1);

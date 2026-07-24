@@ -43,7 +43,7 @@ By default the app reads from:
 https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
 ```
 
-If the current machine cannot list the bucket, run it on `ospf1` or place `.jsonl.gz` files under `data/raw/` and start again.
+If the current machine cannot list the bucket, run it from any authorized host with S3 access or place `.jsonl.gz` files under `data/raw/` and start again.
 
 ## Environment
 
@@ -64,7 +64,7 @@ S3_FETCH_MODE=http
 S3_BUCKET_URL=https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
 S3_BUCKET_NAME=<BUCKET-NAME>
 AWS_REGION=us-east-1
-LOG_PREFIX=CloudConnexa/wellesley/
+LOG_PREFIX=CloudConnexa/<CLOUD-ID>/
 
 # Optional MySQL aggregate count storage.
 MYSQL_HOST=127.0.0.1
@@ -77,9 +77,9 @@ MYSQL_DATABASE=openvpn_log_browser
 SAML_ENABLED=false
 SAML_REQUIRE_AUTH=false
 SAML_SP_ENTITY_ID=openvpn-log-browser
-SAML_CALLBACK_URL=https://logs.example.edu/auth/saml/callback
-SAML_ENTRY_POINT=https://idp.example.edu/sso/saml
-SAML_LOGOUT_URL=https://idp.example.edu/slo/saml
+SAML_CALLBACK_URL=https://logs.example.com/auth/saml/callback
+SAML_ENTRY_POINT=https://idp.example.com/sso/saml
+SAML_LOGOUT_URL=https://idp.example.com/slo/saml
 SAML_IDP_CERT=<idp signing certificate>
 SAML_AUDIENCE=
 SAML_WANT_ASSERTIONS_SIGNED=true
@@ -87,14 +87,16 @@ SAML_WANT_RESPONSE_SIGNED=false
 SAML_DISABLE_REQUESTED_AUTHN_CONTEXT=true
 ```
 
-When MySQL is configured, the app stores only aggregate licensing telemetry:
+When MySQL/MariaDB is configured, the app uses it for two local caches:
 
-- sample timestamp
-- connected user count
-- excluded reconnect-heavy user count
+- parsed, normalized log events keyed by S3 object fingerprint
+- aggregate connected-user counts for licensing trend analysis
 
-The `connected_user_counts` table contains only those three columns.
-No usernames, IPs, session IDs, raw logs, or event payloads are written to MySQL. Samples older than 365 days are deleted automatically.
+The parsed log index lets the app restart quickly without reparsing every `.jsonl.gz` object. S3 remains the source of truth; new or changed S3 objects are downloaded, parsed, and upserted into MariaDB.
+
+When the parsed log index is available, search, stats, facets, record detail, and reconnect summaries are served from MariaDB instead of hydrating every event into Node.js memory.
+
+The aggregate count history is stored in `connected_user_counts`. Samples older than 365 days are deleted automatically.
 
 SAML settings can also be managed in the app from `Menu` -> `Settings`. The app exposes SP metadata at `/auth/saml/metadata` after SAML is configured.
 
@@ -127,11 +129,11 @@ The app refreshes logs in three ways:
 
 `AUTO_REFRESH_MINUTES` controls both the server background refresh interval and the browser idle refresh timer. The default is `30`. Set it to `0` to disable automatic refreshes.
 
-For S3 sources, reloads are incremental. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads only new or changed objects. Unchanged objects reuse their in-memory parsed records while the server stays running, or the local S3 object cache after a restart.
+For S3 sources, reloads are incremental. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads only new or changed objects. Unchanged objects reuse their in-memory parsed records while the server stays running, the MariaDB parsed-log index after a restart, or the local S3 object cache when an object needs to be reparsed.
 
 The local S3 object cache is stored under `S3_CACHE_DIR`, which defaults to `data/s3-cache` inside the app directory. The cache stores gzipped log objects and `manifest.json`; protect this directory like VPN logs. It is ignored by Git.
 
-After a service restart, the in-memory parsed cache is empty, so the first load parses from the local S3 object cache where possible and only downloads objects missing from disk or changed in S3. Cold loads process newest S3 objects first so the dashboard shows recent activity while older logs continue loading.
+After a service restart, the app hydrates from the MariaDB parsed-log index first, then refreshes S3 in the background. If MariaDB has no indexed copy of an unchanged object yet, the loader parses from the local S3 object cache where possible and only downloads objects missing from disk or changed in S3.
 
 `FETCH_CONCURRENCY` controls how many new or changed S3 objects are downloaded in parallel. The default is `32`. Increase it only if the VM has spare CPU and memory; lower it if Node uses too much CPU or RSS during a cold load.
 
@@ -148,9 +150,16 @@ The main screen is split into a compact dashboard, filters, and the event list:
 
 Use `Menu` -> `Settings` for timezone and SAML configuration. The timezone selection affects displayed timestamps in the dashboard, table, and detail pane.
 
-## Aggregate Count Storage
+## MariaDB Storage
 
-MySQL is optional. When configured, it creates and maintains:
+MySQL/MariaDB is optional. When configured, it creates and maintains a parsed log index:
+
+```sql
+log_s3_objects(source_hash, object_hash, object_key, fingerprint, parsed_at, record_count, ...)
+log_events(id_hash, source_hash, object_hash, timestamp_dt, user_name, public_ip, raw_json, ...)
+```
+
+It also creates and maintains the aggregate count table:
 
 ```sql
 CREATE TABLE IF NOT EXISTS connected_user_counts (
@@ -160,9 +169,9 @@ CREATE TABLE IF NOT EXISTS connected_user_counts (
 );
 ```
 
-The app samples connected-user counts after log refreshes and deletes samples older than 365 days. This is intended for license-sizing trend analysis only.
+The app samples connected-user counts after log refreshes and deletes aggregate samples older than 365 days. This is intended for license-sizing trend analysis only.
 
-The table does not contain usernames, IP addresses, device IDs, session IDs, raw logs, or event payloads.
+The parsed log index contains normalized operational fields and raw event JSON so the app can search quickly after restart. Protect the MariaDB database as VPN log data.
 
 ## S3 Bucket Access
 
@@ -244,7 +253,7 @@ Security note: IP-based bucket policies are useful for a small internal tool, bu
 ## Notes
 
 - The app keeps logs in memory for fast filtering.
-- S3 reloads keep a per-object parsed-record cache in memory and a gzipped object cache under `data/s3-cache`.
+- S3 reloads keep a per-object parsed-record cache in memory, a MariaDB parsed-log index when configured, and a gzipped object cache under `data/s3-cache`.
 - Search checks normalized fields and raw JSON across the full loaded log set.
 - Connection logs are normalized into user, device, public IP, tunnel IP, OS, gateway, protocol, session ID, duration, transfer volume, and disconnect reason.
 - The event list displays normalized operational fields and can be searched by username, IP, device, operation, gateway, trace ID, and other common fields.
