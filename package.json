@@ -11,6 +11,7 @@
   "scripts": {
     "start": "node server.js",
     "ingest": "node server.js --ingest",
+    "worker": "node server.js --worker",
     "dev": "node server.js"
   },
   "engines": {

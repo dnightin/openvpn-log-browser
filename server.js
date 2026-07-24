@@ -21,6 +21,7 @@ const FETCH_CONCURRENCY = Math.max(1, Number(process.env.FETCH_CONCURRENCY || 32
 const LOAD_BATCH_DELAY_MS = Math.max(0, Number(process.env.LOAD_BATCH_DELAY_MS || 0));
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 6));
+const LOG_INDEX_RETENTION_DAYS = Math.max(0, Number(process.env.LOG_INDEX_RETENTION_DAYS || 0));
 const SESSION_COOKIE = "openvpn_log_browser_session";
 const MYSQL_ENABLED = Boolean(process.env.MYSQL_HOST || process.env.MYSQL_USER || process.env.MYSQL_DATABASE);
 const MYSQL_CONFIG = {
@@ -30,6 +31,7 @@ const MYSQL_CONFIG = {
   password: process.env.MYSQL_PASSWORD || "",
   database: process.env.MYSQL_DATABASE || "openvpn_log_browser"
 };
+const WEB_INGEST_ENABLED = process.env.WEB_INGEST_ENABLED ? toBool(process.env.WEB_INGEST_ENABLED) : !MYSQL_ENABLED;
 const SECRET_KEY_RE = /(token|secret|password|credential|private.?key|client.?key|refresh|bearer|session)/i;
 
 let store = {
@@ -43,6 +45,7 @@ let refreshPromise = null;
 let mysqlPool = null;
 let mysqlStatus = MYSQL_ENABLED ? "not connected" : "disabled";
 let mysqlLogIndexReady = false;
+let mysqlFullTextReady = false;
 let samlSettings = envSamlSettings();
 let sourceSettings = null;
 let objectRecordCache = new Map();
@@ -676,6 +679,7 @@ async function loadFromS3() {
     await yieldToEventLoop(LOAD_BATCH_DELAY_MS);
   }
   await saveS3CacheManifest(manifest, seenKeys);
+  await pruneLogIndexRetention(sourceHash);
   return {
     records,
     objects,
@@ -877,6 +881,35 @@ async function initMysql() {
       KEY session_idx (session_id)
     )
   `);
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS log_stats_cache (
+      source_hash CHAR(64) NOT NULL PRIMARY KEY,
+      records BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      objects BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      active_sessions INT UNSIGNED NOT NULL DEFAULT 0,
+      active_users INT UNSIGNED NOT NULL DEFAULT 0,
+      first_timestamp VARCHAR(64) NOT NULL DEFAULT '',
+      last_timestamp VARCHAR(64) NOT NULL DEFAULT '',
+      total_bytes_in BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      total_bytes_out BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      by_event_json LONGTEXT NOT NULL,
+      by_day_json LONGTEXT NOT NULL,
+      generated_at DATETIME NOT NULL
+    )
+  `);
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS active_sessions_snapshot (
+      source_hash CHAR(64) NOT NULL,
+      user_name VARCHAR(255) NOT NULL,
+      session_id VARCHAR(128) NOT NULL DEFAULT '',
+      event_timestamp DATETIME NULL,
+      timestamp_text VARCHAR(64) NOT NULL DEFAULT '',
+      generated_at DATETIME NOT NULL,
+      PRIMARY KEY (source_hash, user_name),
+      KEY generated_at_idx (generated_at)
+    )
+  `);
+  await ensureMysqlLogIndexes();
   mysqlLogIndexReady = true;
   const sourceHash = hashId(sourceCacheId(sourceConfig()));
   const indexedObjects = await loadIndexedObjectsFromMysql(sourceHash);
@@ -889,6 +922,45 @@ async function initMysql() {
     error: indexedObjects.length ? null : store.error
   };
   mysqlStatus = "connected";
+}
+
+async function ensureMysqlLogIndexes() {
+  mysqlFullTextReady = await mysqlIndexExists("log_events", "search_text_ft");
+  if (!mysqlFullTextReady) {
+    await ignoreMysqlIndexError(async () => {
+      await mysqlPool.query("ALTER TABLE log_events ADD FULLTEXT INDEX search_text_ft (search_text)");
+      mysqlFullTextReady = true;
+    });
+  }
+  mysqlFullTextReady = mysqlFullTextReady || await mysqlIndexExists("log_events", "search_text_ft");
+  if (!await mysqlIndexExists("log_s3_objects", "last_modified_idx")) {
+    await ignoreMysqlIndexError(() => mysqlPool.query("ALTER TABLE log_s3_objects ADD KEY last_modified_idx (last_modified)"));
+  }
+}
+
+async function mysqlIndexExists(tableName, indexName) {
+  const [rows] = await mysqlPool.execute(
+    `SELECT COUNT(*) AS count
+     FROM information_schema.statistics
+     WHERE table_schema = DATABASE()
+       AND table_name = ?
+       AND index_name = ?`,
+    [tableName, indexName]
+  );
+  return Number(rows[0]?.count || 0) > 0;
+}
+
+async function ignoreMysqlIndexError(operation) {
+  try {
+    await operation();
+  } catch (error) {
+    if (error && (error.code === "ER_DUP_KEYNAME" || error.errno === 1061)) return;
+    if (error && (error.code === "ER_TABLEACCESS_DENIED_ERROR" || error.errno === 1142)) {
+      console.error(`Skipping optional MariaDB index creation: ${error.message}`);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function saveConnectedCountSample() {
@@ -908,6 +980,24 @@ async function saveConnectedCountSample() {
     mysqlStatus = `unavailable: ${error.message}`;
     console.error(error);
   }
+}
+
+async function pruneLogIndexRetention(sourceHash) {
+  if (!mysqlPool || !mysqlLogIndexReady || !LOG_INDEX_RETENTION_DAYS) return;
+  await mysqlPool.execute(
+    `DELETE e FROM log_events e
+     JOIN log_s3_objects o
+       ON o.source_hash = e.source_hash AND o.object_hash = e.object_hash
+     WHERE e.source_hash = ?
+       AND o.last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY`,
+    [sourceHash, LOG_INDEX_RETENTION_DAYS]
+  );
+  await mysqlPool.execute(
+    `DELETE FROM log_s3_objects
+     WHERE source_hash = ?
+       AND last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY`,
+    [sourceHash, LOG_INDEX_RETENTION_DAYS]
+  );
 }
 
 function mysqlDate(date) {
@@ -1182,8 +1272,13 @@ function mysqlSearchWhere(params, sourceHash) {
   const start = params.get("start") || "";
   const end = params.get("end") || "";
   if (q) {
-    where.push("search_text LIKE ?");
-    values.push(`%${q}%`);
+    if (mysqlFullTextReady) {
+      where.push("MATCH(search_text) AGAINST (? IN BOOLEAN MODE)");
+      values.push(mysqlBooleanSearchQuery(q));
+    } else {
+      where.push("search_text LIKE ?");
+      values.push(`%${q}%`);
+    }
   }
   if (category) {
     where.push("category = ?");
@@ -1210,6 +1305,14 @@ function mysqlSearchWhere(params, sourceHash) {
     values.push(end);
   }
   return { sql: where.join(" AND "), values };
+}
+
+function mysqlBooleanSearchQuery(value) {
+  const terms = String(value || "")
+    .toLowerCase()
+    .match(/[a-z0-9@._:-]+/g);
+  if (!terms || !terms.length) return "";
+  return terms.slice(0, 12).map((term) => `+${term}${term.length >= 3 ? "*" : ""}`).join(" ");
 }
 
 async function filterRecordsFromMysql(params) {
@@ -1262,6 +1365,61 @@ async function recordFromMysql(id) {
 }
 
 async function statsFromMysql(timeZone = "UTC") {
+  const cached = await cachedStatsFromMysql(timeZone);
+  if (cached) return cached;
+  return buildStatsFromMysql(timeZone);
+}
+
+async function cachedStatsFromMysql(timeZone = "UTC") {
+  const sourceHash = currentSourceHash();
+  const [rows] = await mysqlPool.execute(
+    `SELECT records,
+            objects,
+            active_sessions,
+            active_users,
+            first_timestamp,
+            last_timestamp,
+            total_bytes_in,
+            total_bytes_out,
+            by_event_json,
+            by_day_json,
+            generated_at
+     FROM log_stats_cache
+     WHERE source_hash = ?
+     LIMIT 1`,
+    [sourceHash]
+  );
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    records: Number(row.records || 0),
+    objects: Number(row.objects || store.objects.length || 0),
+    activeSessions: Number(row.active_sessions || 0),
+    activeUsers: Number(row.active_users || 0),
+    mysql: mysqlStatus,
+    byEvent: parseMysqlJson(row.by_event_json, {}),
+    totalBytesIn: Number(row.total_bytes_in || 0),
+    totalBytesOut: Number(row.total_bytes_out || 0),
+    source: store.source,
+    loadedAt: row.generated_at ? new Date(row.generated_at).toISOString() : store.loadedAt,
+    error: store.error,
+    loading: Boolean(refreshPromise),
+    firstTimestamp: row.first_timestamp || "",
+    lastTimestamp: row.last_timestamp || "",
+    timeZone: normalizeTimeZone(timeZone),
+    byDay: parseMysqlJson(row.by_day_json, {})
+  };
+}
+
+function parseMysqlJson(value, fallback) {
+  try {
+    return JSON.parse(value || "");
+  } catch {
+    return fallback;
+  }
+}
+
+async function buildStatsFromMysql(timeZone = "UTC") {
   const sourceHash = currentSourceHash();
   const displayTimeZone = normalizeTimeZone(timeZone);
   const [[summary]] = await mysqlPool.execute(
@@ -1308,6 +1466,80 @@ async function statsFromMysql(timeZone = "UTC") {
   };
 }
 
+async function updateMysqlMaterializedViews() {
+  if (!mysqlPool || !mysqlLogIndexReady) return;
+  const sourceHash = currentSourceHash();
+  const statsData = await buildStatsFromMysql("UTC");
+  const generatedAt = mysqlDate(new Date());
+  await mysqlPool.execute(
+    `INSERT INTO log_stats_cache (
+       source_hash,
+       records,
+       objects,
+       active_sessions,
+       active_users,
+       first_timestamp,
+       last_timestamp,
+       total_bytes_in,
+       total_bytes_out,
+       by_event_json,
+       by_day_json,
+       generated_at
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       records = VALUES(records),
+       objects = VALUES(objects),
+       active_sessions = VALUES(active_sessions),
+       active_users = VALUES(active_users),
+       first_timestamp = VALUES(first_timestamp),
+       last_timestamp = VALUES(last_timestamp),
+       total_bytes_in = VALUES(total_bytes_in),
+       total_bytes_out = VALUES(total_bytes_out),
+       by_event_json = VALUES(by_event_json),
+       by_day_json = VALUES(by_day_json),
+       generated_at = VALUES(generated_at)`,
+    [
+      sourceHash,
+      statsData.records,
+      statsData.objects,
+      statsData.activeSessions,
+      statsData.activeUsers,
+      statsData.firstTimestamp,
+      statsData.lastTimestamp,
+      statsData.totalBytesIn,
+      statsData.totalBytesOut,
+      JSON.stringify(statsData.byEvent || {}),
+      JSON.stringify(statsData.byDay || {}),
+      generatedAt
+    ]
+  );
+  const newest = statsData.lastTimestamp ? Date.parse(statsData.lastTimestamp) : Date.now();
+  const activeRows = await latestActiveConnectionsFromMysql(newest);
+  await mysqlPool.execute("DELETE FROM active_sessions_snapshot WHERE source_hash = ?", [sourceHash]);
+  for (const session of activeRows) {
+    await mysqlPool.execute(
+      `INSERT INTO active_sessions_snapshot (
+         source_hash,
+         user_name,
+         session_id,
+         event_timestamp,
+         timestamp_text,
+         generated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        sourceHash,
+        session.userName,
+        session.sessionId || "",
+        Number.isFinite(session.timestamp) ? mysqlDate(new Date(session.timestamp)) : null,
+        Number.isFinite(session.timestamp) ? new Date(session.timestamp).toISOString() : "",
+        generatedAt
+      ]
+    );
+  }
+}
+
 async function connectionRecordsFromMysqlSince(cutoff) {
   const [rows] = await mysqlPool.execute(
     `${mysqlRecordSelect(false)}
@@ -1351,12 +1583,31 @@ async function connectedUsersSnapshotFromMysql() {
   const newest = row.newest ? Date.parse(row.newest) : Date.now();
   const cutoff = newest - (24 * 60 * 60 * 1000);
   const excludedUsers = await excessiveReconnectUsersFromMysql(newest, cutoff);
-  const activeRows = (await latestActiveConnectionsFromMysql(newest)).filter((session) => !excludedUsers.has(session.userName));
+  const activeRows = (await activeConnectionsSnapshotFromMysql(newest)).filter((session) => !excludedUsers.has(session.userName));
   return {
     connectedUsers: new Set(activeRows.map((session) => session.userName)).size,
     excludedUsers: excludedUsers.size,
     generatedAt: new Date(newest).toISOString()
   };
+}
+
+async function activeConnectionsSnapshotFromMysql(atTime = Date.now()) {
+  const staleCutoff = atTime - (ACTIVE_SESSION_MAX_AGE_HOURS * 60 * 60 * 1000);
+  const [rows] = await mysqlPool.execute(
+    `SELECT user_name, session_id, event_timestamp, timestamp_text
+     FROM active_sessions_snapshot
+     WHERE source_hash = ?
+       AND (event_timestamp IS NULL OR event_timestamp >= ?)
+     ORDER BY user_name`,
+    [currentSourceHash(), mysqlDate(new Date(staleCutoff))]
+  );
+  if (!rows.length) return latestActiveConnectionsFromMysql(atTime);
+  return rows.map((row) => ({
+    userName: row.user_name,
+    sessionId: row.session_id || "",
+    eventName: "client-connected",
+    timestamp: row.event_timestamp ? Date.parse(row.event_timestamp) : Date.parse(row.timestamp_text)
+  }));
 }
 
 async function excessiveReconnectUsersFromMysql(newest, cutoff) {
@@ -1425,6 +1676,7 @@ async function refreshNow() {
   try {
     const loaded = await loadFromS3();
     store = { ...loaded, loadedAt: new Date().toISOString(), error: loaded.error || null };
+    await updateMysqlMaterializedViews();
     await saveConnectedCountSample();
   } catch (s3Error) {
     const s3Message = s3Error.message || "access denied or network blocked";
@@ -1435,6 +1687,7 @@ async function refreshNow() {
         loadedAt: new Date().toISOString(),
         error: `S3 unavailable (${s3Message}); loaded local cache instead.`
       };
+      await updateMysqlMaterializedViews();
       await saveConnectedCountSample();
     } catch (localError) {
       store = {
@@ -1946,6 +2199,10 @@ async function handler(req, res) {
       return json(res, { ...record, searchText: undefined, raw: redact(raw), churn });
     }
     if (url.pathname === "/api/reload" && req.method === "POST") {
+      if (!WEB_INGEST_ENABLED && mysqlLogIndexAvailable()) {
+        store = { ...store, error: null };
+        return json(res, await statsFromMysql());
+      }
       refresh().catch((error) => {
         store = { ...store, error: error.message };
         console.error(error);
@@ -2854,31 +3111,66 @@ const INDEX_HTML = `<!doctype html>
 </html>`;
 
 if (process.argv.includes("--ingest")) {
-  Promise.all([loadSamlSettings(), loadSourceSettings()]).then(() => initMysql()).then(() => refresh()).then(async () => {
-    console.log(JSON.stringify(mysqlLogIndexAvailable() ? await statsFromMysql() : stats(), null, 2));
-  }).catch((error) => {
+  runIngestOnce().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+} else if (process.argv.includes("--worker")) {
+  runIngestWorker().catch((error) => {
     console.error(error);
     process.exit(1);
   });
 } else {
   http.createServer(handler).listen(PORT, () => {
     console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
-    Promise.all([loadSamlSettings(), loadSourceSettings()]).then(() =>
-      initMysql().catch((error) => {
-        mysqlStatus = `unavailable: ${error.message}`;
-        console.error(error);
-      })
-    ).catch(console.error).finally(() => refresh().catch((error) => {
-      store = { ...store, error: error.message };
-      console.error(error);
-    }));
-    if (AUTO_REFRESH_MINUTES > 0) {
-      setInterval(() => {
+    initializeApp().then(() => {
+      if (WEB_INGEST_ENABLED) {
         refresh().catch((error) => {
           store = { ...store, error: error.message };
           console.error(error);
         });
-      }, AUTO_REFRESH_MINUTES * 60 * 1000);
-    }
+        if (AUTO_REFRESH_MINUTES > 0) {
+          setInterval(() => {
+            refresh().catch((error) => {
+              store = { ...store, error: error.message };
+              console.error(error);
+            });
+          }, AUTO_REFRESH_MINUTES * 60 * 1000);
+        }
+      }
+    }).catch(console.error);
   });
+}
+
+async function initializeApp() {
+  await Promise.all([loadSamlSettings(), loadSourceSettings()]);
+  await initMysql().catch((error) => {
+    mysqlStatus = `unavailable: ${error.message}`;
+    console.error(error);
+  });
+}
+
+async function runIngestOnce() {
+  await initializeApp();
+  await refresh();
+  console.log(JSON.stringify(mysqlLogIndexAvailable() ? await statsFromMysql() : stats(), null, 2));
+}
+
+async function runIngestWorker() {
+  await initializeApp();
+  console.log("OpenVPN Log Search ingest worker started.");
+  for (;;) {
+    try {
+      await refresh();
+      console.log(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        stats: mysqlLogIndexAvailable() ? await statsFromMysql() : stats()
+      }));
+    } catch (error) {
+      store = { ...store, error: error.message };
+      console.error(error);
+    }
+    const delayMs = Math.max(1, AUTO_REFRESH_MINUTES || 30) * 60 * 1000;
+    await yieldToEventLoop(delayMs);
+  }
 }

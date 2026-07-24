@@ -2,7 +2,7 @@
 
 Small web app for authorized CloudConnexa/OpenVPN audit logs stored as gzipped JSONL in S3.
 
-The app is designed for operational log review, not long-term raw-log warehousing. It keeps the searchable log set in memory, optionally records aggregate connected-user counts in MySQL for licensing analysis, and avoids writing usernames, IPs, sessions, or raw event payloads to the database.
+The app is designed for operational log review, not long-term raw-log warehousing. With MariaDB configured, it stores a parsed local search index and serves search, stats, and detail views from the database instead of holding the full log set in Node.js memory. It also records one year of aggregate connected-user counts for licensing analysis.
 
 ## Features
 
@@ -58,6 +58,8 @@ FETCH_CONCURRENCY=32
 LOAD_BATCH_DELAY_MS=0
 AUTO_REFRESH_MINUTES=30
 ACTIVE_SESSION_MAX_AGE_HOURS=6
+WEB_INGEST_ENABLED=false
+LOG_INDEX_RETENTION_DAYS=0
 
 # Log source.
 S3_FETCH_MODE=http
@@ -90,11 +92,16 @@ SAML_DISABLE_REQUESTED_AUTHN_CONTEXT=true
 When MySQL/MariaDB is configured, the app uses it for two local caches:
 
 - parsed, normalized log events keyed by S3 object fingerprint
+- worker-maintained dashboard stats and active-session snapshots
 - aggregate connected-user counts for licensing trend analysis
 
 The parsed log index lets the app restart quickly without reparsing every `.jsonl.gz` object. S3 remains the source of truth; new or changed S3 objects are downloaded, parsed, and upserted into MariaDB.
 
 When the parsed log index is available, search, stats, facets, record detail, and reconnect summaries are served from MariaDB instead of hydrating every event into Node.js memory.
+
+The parsed log index includes a MariaDB full-text index on `search_text` for keyword searches.
+
+The worker updates `log_stats_cache` and `active_sessions_snapshot` after each ingest. This keeps the dashboard and reload button from recomputing large event aggregates during normal UI use.
 
 The aggregate count history is stored in `connected_user_counts`. Samples older than 365 days are deleted automatically.
 
@@ -127,7 +134,17 @@ The app refreshes logs in three ways:
 - POST to `/api/reload`.
 - Let the automatic 30-minute refresh run.
 
-`AUTO_REFRESH_MINUTES` controls both the server background refresh interval and the browser idle refresh timer. The default is `30`. Set it to `0` to disable automatic refreshes.
+`AUTO_REFRESH_MINUTES` controls the ingest worker interval and the browser idle refresh timer. The default is `30`. Set it to `0` to disable the browser idle refresh timer; the worker treats `0` as a 30-minute loop interval.
+
+When MariaDB is configured, run ingestion separately from the web process:
+
+```powershell
+npm run worker
+```
+
+The web process does not run S3 ingestion by default when MariaDB is enabled. Set `WEB_INGEST_ENABLED=true` only if you intentionally want the web server to perform S3 refreshes inline.
+
+In this split mode, the Reload button returns the latest MariaDB-backed view; it does not start a full S3 ingest from the web process. The ingest worker is responsible for finding new or changed objects and refreshing the materialized stats.
 
 For S3 sources, reloads are incremental. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads only new or changed objects. Unchanged objects reuse their in-memory parsed records while the server stays running, the MariaDB parsed-log index after a restart, or the local S3 object cache when an object needs to be reparsed.
 
@@ -136,6 +153,8 @@ The local S3 object cache is stored under `S3_CACHE_DIR`, which defaults to `dat
 After a service restart, the app hydrates from the MariaDB parsed-log index first, then refreshes S3 in the background. If MariaDB has no indexed copy of an unchanged object yet, the loader parses from the local S3 object cache where possible and only downloads objects missing from disk or changed in S3.
 
 `FETCH_CONCURRENCY` controls how many new or changed S3 objects are downloaded in parallel. The default is `32`. Increase it only if the VM has spare CPU and memory; lower it if Node uses too much CPU or RSS during a cold load.
+
+`LOG_INDEX_RETENTION_DAYS` optionally prunes parsed log rows and indexed S3 object fingerprints older than the selected number of days. The default `0` keeps the parsed index until S3/source changes or you clean it manually. This does not affect `connected_user_counts`, which keeps one year of aggregate count history.
 
 ## Interface Notes
 
@@ -172,6 +191,8 @@ CREATE TABLE IF NOT EXISTS connected_user_counts (
 The app samples connected-user counts after log refreshes and deletes aggregate samples older than 365 days. This is intended for license-sizing trend analysis only.
 
 The parsed log index contains normalized operational fields and raw event JSON so the app can search quickly after restart. Protect the MariaDB database as VPN log data.
+
+The parsed log index can be pruned with `LOG_INDEX_RETENTION_DAYS`. The aggregate connection-count history remains independent and is retained for one year.
 
 ## S3 Bucket Access
 
