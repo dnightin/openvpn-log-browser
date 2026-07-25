@@ -22,6 +22,8 @@ const LOAD_BATCH_DELAY_MS = Math.max(0, Number(process.env.LOAD_BATCH_DELAY_MS |
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 6));
 const LOG_INDEX_RETENTION_DAYS = Math.max(0, Number(process.env.LOG_INDEX_RETENTION_DAYS || 0));
+const SLOW_API_MS = Math.max(0, Number(process.env.SLOW_API_MS || 500));
+const SLOW_DB_MS = Math.max(0, Number(process.env.SLOW_DB_MS || 500));
 const SESSION_COOKIE = "openvpn_log_browser_session";
 const MYSQL_ENABLED = Boolean(process.env.MYSQL_HOST || process.env.MYSQL_USER || process.env.MYSQL_DATABASE);
 const MYSQL_CONFIG = {
@@ -50,6 +52,7 @@ let samlSettings = envSamlSettings();
 let sourceSettings = null;
 let objectRecordCache = new Map();
 let objectRecordCacheSource = "";
+let slowEvents = [];
 const sessions = new Map();
 
 function envSourceSettings() {
@@ -909,6 +912,25 @@ async function initMysql() {
       KEY generated_at_idx (generated_at)
     )
   `);
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS log_facets_cache (
+      source_hash CHAR(64) NOT NULL PRIMARY KEY,
+      categories_json LONGTEXT NOT NULL,
+      event_names_json LONGTEXT NOT NULL,
+      operating_systems_json LONGTEXT NOT NULL,
+      gateways_json LONGTEXT NOT NULL,
+      users_json LONGTEXT NOT NULL,
+      ips_json LONGTEXT NOT NULL,
+      generated_at DATETIME NOT NULL
+    )
+  `);
+  await mysqlPool.query(`
+    CREATE TABLE IF NOT EXISTS churn_watch_cache (
+      source_hash CHAR(64) NOT NULL PRIMARY KEY,
+      payload_json LONGTEXT NOT NULL,
+      generated_at DATETIME NOT NULL
+    )
+  `);
   await ensureMysqlLogIndexes();
   mysqlLogIndexReady = true;
   const sourceHash = hashId(sourceCacheId(sourceConfig()));
@@ -970,6 +992,34 @@ async function ignoreMysqlIndexError(operation) {
       return;
     }
     throw error;
+  }
+}
+
+async function timedMysqlExecute(label, sql, values = []) {
+  const start = Date.now();
+  try {
+    return await mysqlPool.execute(sql, values);
+  } finally {
+    logSlow("db", label, Date.now() - start);
+  }
+}
+
+async function timedMysqlQuery(label, sql, values = []) {
+  const start = Date.now();
+  try {
+    return await mysqlPool.query(sql, values);
+  } finally {
+    logSlow("db", label, Date.now() - start);
+  }
+}
+
+function logSlow(kind, label, elapsedMs) {
+  const threshold = kind === "api" ? SLOW_API_MS : SLOW_DB_MS;
+  if (threshold && elapsedMs >= threshold) {
+    const event = { timestamp: new Date().toISOString(), kind: "slow-" + kind, label, elapsedMs };
+    slowEvents.push(event);
+    if (slowEvents.length > 50) slowEvents = slowEvents.slice(-50);
+    console.warn(JSON.stringify(event));
   }
 }
 
@@ -1272,7 +1322,7 @@ function mysqlRecordSelect(includeRaw = false) {
           FROM log_events`;
 }
 
-function mysqlSearchWhere(params, sourceHash) {
+function mysqlSearchWhere(params, sourceHash, fieldMatch = null) {
   const where = ["source_hash = ?"];
   const values = [sourceHash];
   const q = (params.get("q") || "").trim().toLowerCase();
@@ -1283,7 +1333,10 @@ function mysqlSearchWhere(params, sourceHash) {
   const start = params.get("start") || "";
   const end = params.get("end") || "";
   if (q) {
-    if (mysqlFullTextReady) {
+    if (fieldMatch) {
+      where.push(`${fieldMatch.column} = ?`);
+      values.push(fieldMatch.value);
+    } else if (mysqlFullTextReady) {
       where.push("MATCH(search_text) AGAINST (? IN BOOLEAN MODE)");
       values.push(mysqlBooleanSearchQuery(q));
     } else {
@@ -1330,6 +1383,40 @@ function mysqlSearchWhere(params, sourceHash) {
   return { sql: where.join(" AND "), values };
 }
 
+function mysqlCursorWhere(params) {
+  const cursor = decodeSearchCursor(params.get("cursor") || "");
+  if (!cursor) return { sql: "", values: [], cursor: null };
+  const cursorDate = mysqlDateOrNull(cursor.timestamp);
+  if (!cursorDate || !cursor.idHash) return { sql: "", values: [], cursor: null };
+  return {
+    sql: " AND (timestamp_dt < ? OR (timestamp_dt = ? AND id_hash < ?))",
+    values: [cursorDate, cursorDate, cursor.idHash],
+    cursor
+  };
+}
+
+function decodeSearchCursor(value) {
+  if (!value) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8"));
+    if (!decoded || typeof decoded !== "object") return null;
+    return {
+      timestamp: String(decoded.timestamp || ""),
+      idHash: String(decoded.idHash || "")
+    };
+  } catch {
+    return null;
+  }
+}
+
+function encodeSearchCursor(record) {
+  if (!record || !record.timestamp || !record.id) return "";
+  return Buffer.from(JSON.stringify({
+    timestamp: record.timestamp,
+    idHash: hashId(record.id)
+  })).toString("base64url");
+}
+
 function mysqlBooleanSearchQuery(value) {
   const terms = String(value || "")
     .toLowerCase()
@@ -1341,22 +1428,89 @@ function mysqlBooleanSearchQuery(value) {
 async function filterRecordsFromMysql(params) {
   const sourceHash = currentSourceHash();
   const limit = Math.min(Number(params.get("limit") || 1000), 10000);
-  const { sql, values } = mysqlSearchWhere(params, sourceHash);
+  const fieldMatch = await mysqlSearchFieldMatch(params);
+  const { sql, values } = mysqlSearchWhere(params, sourceHash, fieldMatch);
+  const cursorWhere = mysqlCursorWhere(params);
   const searched = await mysqlIndexedRecordCount(sourceHash);
-  const [[totalRow]] = await mysqlPool.execute(`SELECT COUNT(*) AS count FROM log_events WHERE ${sql}`, values);
-  const [rows] = await mysqlPool.execute(
+  const countMode = mysqlSearchCountMode(params, fieldMatch);
+  const cachedTotal = countMode === "exact" ? await mysqlCachedSearchCount(params, fieldMatch, sourceHash) : null;
+  const total = countMode === "exact" ? cachedTotal ?? await mysqlSearchCount(sql, values) : null;
+  const [rows] = await timedMysqlExecute(
+    "search-list",
     `${mysqlRecordSelect(false)}
-     WHERE ${sql}
+     WHERE ${sql}${cursorWhere.sql}
      ORDER BY timestamp_dt DESC, id_hash DESC
      LIMIT ?`,
-    [...values, limit]
+    [...values, ...cursorWhere.values, limit + 1]
   );
+  const records = rows.slice(0, limit).map(mysqlRowToRecord);
+  const hasMore = rows.length > limit;
   return {
     searched,
-    total: Number(totalRow.count || 0),
+    total,
+    totalIsExact: countMode === "exact",
     limit,
-    rows: rows.map(mysqlRowToRecord)
+    hasMore,
+    nextCursor: hasMore ? encodeSearchCursor(records[records.length - 1]) : "",
+    rows: records
   };
+}
+
+function mysqlSearchCountMode(params, fieldMatch = null) {
+  if (params.get("exactTotal") === "1") return "exact";
+  if (fieldMatch) return "exact";
+  const q = (params.get("q") || "").trim();
+  if (q && mysqlFullTextReady) return "deferred";
+  return "exact";
+}
+
+async function mysqlSearchCount(sql, values) {
+  const [[row]] = await timedMysqlExecute("search-count", `SELECT COUNT(*) AS count FROM log_events WHERE ${sql}`, values);
+  return Number(row.count || 0);
+}
+
+async function mysqlCachedSearchCount(params, fieldMatch, sourceHash) {
+  const q = (params.get("q") || "").trim();
+  const category = params.get("category") || "";
+  const eventName = params.get("eventName") || "";
+  const os = params.get("os") || "";
+  const gateway = params.get("gateway") || "";
+  const start = params.get("start") || "";
+  const end = params.get("end") || "";
+  if (category || os || gateway || start || end) return null;
+  const searched = await mysqlIndexedRecordCount(sourceHash);
+  if (!q && !eventName) return searched;
+  const eventValue = eventName || (fieldMatch && fieldMatch.column === "event_name" ? fieldMatch.value : "");
+  if (!eventValue) return null;
+  const [rows] = await timedMysqlExecute(
+    "stats-cache-event-count",
+    "SELECT by_event_json FROM log_stats_cache WHERE source_hash = ? LIMIT 1",
+    [sourceHash]
+  );
+  if (!rows.length) return null;
+  const byEvent = parseMysqlJson(rows[0].by_event_json, {});
+  return Number(byEvent[eventValue] || 0);
+}
+
+async function mysqlSearchFieldMatch(params) {
+  const q = (params.get("q") || "").trim();
+  if (!q || q.includes(" ")) return null;
+  const facetsData = await cachedFacetsFromMysql();
+  if (!facetsData) return null;
+  const checks = [
+    ["eventNames", "event_name"],
+    ["categories", "category"],
+    ["users", "user_name"],
+    ["ips", "public_ip"],
+    ["gateways", "gateway"]
+  ];
+  const normalized = q.toLowerCase();
+  for (const [key, column] of checks) {
+    const values = Array.isArray(facetsData[key]) ? facetsData[key] : [];
+    const match = values.find((value) => String(value).toLowerCase() === normalized);
+    if (match) return { column, value: match };
+  }
+  return null;
 }
 
 async function mysqlIndexedRecordCount(sourceHash) {
@@ -1370,9 +1524,43 @@ async function mysqlIndexedRecordCount(sourceHash) {
 }
 
 async function facetsFromMysql() {
+  const cached = await cachedFacetsFromMysql();
+  if (cached) return cached;
+  return buildFacetsFromMysql();
+}
+
+async function cachedFacetsFromMysql() {
+  const sourceHash = currentSourceHash();
+  const [rows] = await timedMysqlExecute(
+    "facets-cache",
+    `SELECT categories_json,
+            event_names_json,
+            operating_systems_json,
+            gateways_json,
+            users_json,
+            ips_json
+     FROM log_facets_cache
+     WHERE source_hash = ?
+     LIMIT 1`,
+    [sourceHash]
+  );
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    categories: parseMysqlJson(row.categories_json, []),
+    eventNames: parseMysqlJson(row.event_names_json, []),
+    operatingSystems: parseMysqlJson(row.operating_systems_json, []),
+    gateways: parseMysqlJson(row.gateways_json, []),
+    users: parseMysqlJson(row.users_json, []),
+    ips: parseMysqlJson(row.ips_json, [])
+  };
+}
+
+async function buildFacetsFromMysql() {
   const sourceHash = currentSourceHash();
   const distinct = async (column, suffix = "") => {
-    const [rows] = await mysqlPool.execute(
+    const [rows] = await timedMysqlExecute(
+      "facets-distinct-" + column,
       `SELECT DISTINCT ${column} AS value FROM log_events WHERE source_hash = ? AND ${column} <> '' ORDER BY ${column} LIMIT 250`,
       [sourceHash]
     );
@@ -1387,6 +1575,42 @@ async function facetsFromMysql() {
     users: (await distinct("user_name")).slice(0, 25),
     ips: (await distinct("public_ip")).slice(0, 25)
   };
+}
+
+async function updateMysqlFacetsCache(sourceHash, generatedAt) {
+  const facetsData = await buildFacetsFromMysql();
+  await timedMysqlExecute(
+    "facets-cache-upsert",
+    `INSERT INTO log_facets_cache (
+       source_hash,
+       categories_json,
+       event_names_json,
+       operating_systems_json,
+       gateways_json,
+       users_json,
+       ips_json,
+       generated_at
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       categories_json = VALUES(categories_json),
+       event_names_json = VALUES(event_names_json),
+       operating_systems_json = VALUES(operating_systems_json),
+       gateways_json = VALUES(gateways_json),
+       users_json = VALUES(users_json),
+       ips_json = VALUES(ips_json),
+       generated_at = VALUES(generated_at)`,
+    [
+      sourceHash,
+      JSON.stringify(facetsData.categories || []),
+      JSON.stringify(facetsData.eventNames || []),
+      JSON.stringify(facetsData.operatingSystems || []),
+      JSON.stringify(facetsData.gateways || []),
+      JSON.stringify(facetsData.users || []),
+      JSON.stringify(facetsData.ips || []),
+      generatedAt
+    ]
+  );
 }
 
 async function recordFromMysql(id) {
@@ -1549,28 +1773,36 @@ async function updateMysqlMaterializedViews() {
   );
   const newest = statsData.lastTimestamp ? Date.parse(statsData.lastTimestamp) : Date.now();
   const activeRows = await latestActiveConnectionsFromMysql(newest);
-  await mysqlPool.execute("DELETE FROM active_sessions_snapshot WHERE source_hash = ?", [sourceHash]);
-  for (const session of activeRows) {
-    await mysqlPool.execute(
-      `INSERT INTO active_sessions_snapshot (
-         source_hash,
-         user_name,
-         session_id,
-         event_timestamp,
-         timestamp_text,
-         generated_at
-       )
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [
-        sourceHash,
-        session.userName,
-        session.sessionId || "",
-        Number.isFinite(session.timestamp) ? mysqlDate(new Date(session.timestamp)) : null,
-        Number.isFinite(session.timestamp) ? new Date(session.timestamp).toISOString() : "",
-        generatedAt
-      ]
-    );
-  }
+  await timedMysqlExecute("active-snapshot-clear", "DELETE FROM active_sessions_snapshot WHERE source_hash = ?", [sourceHash]);
+  await insertActiveSessionSnapshotRows(sourceHash, activeRows, generatedAt);
+  await updateMysqlFacetsCache(sourceHash, generatedAt);
+  await updateMysqlChurnCache(sourceHash, generatedAt);
+}
+
+async function insertActiveSessionSnapshotRows(sourceHash, activeRows, generatedAt) {
+  if (!activeRows.length) return;
+  const placeholders = activeRows.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
+  const values = activeRows.flatMap((session) => [
+    sourceHash,
+    session.userName,
+    session.sessionId || "",
+    Number.isFinite(session.timestamp) ? mysqlDate(new Date(session.timestamp)) : null,
+    Number.isFinite(session.timestamp) ? new Date(session.timestamp).toISOString() : "",
+    generatedAt
+  ]);
+  await timedMysqlExecute(
+    "active-snapshot-insert",
+    `INSERT INTO active_sessions_snapshot (
+       source_hash,
+       user_name,
+       session_id,
+       event_timestamp,
+       timestamp_text,
+       generated_at
+     )
+     VALUES ${placeholders}`,
+    values
+  );
 }
 
 async function connectionRecordsFromMysqlSince(cutoff) {
@@ -1655,6 +1887,27 @@ async function excessiveReconnectUsersFromMysql(newest, cutoff) {
 }
 
 async function churnLeaderboardFromMysql(limit = 10) {
+  const cached = await cachedChurnLeaderboardFromMysql(limit);
+  if (cached) return cached;
+  return buildChurnLeaderboardFromMysql(limit);
+}
+
+async function cachedChurnLeaderboardFromMysql(limit = 10) {
+  const [rows] = await timedMysqlExecute(
+    "churn-cache",
+    "SELECT payload_json FROM churn_watch_cache WHERE source_hash = ? LIMIT 1",
+    [currentSourceHash()]
+  );
+  if (!rows.length) return null;
+  const payload = parseMysqlJson(rows[0].payload_json, null);
+  if (!payload || !Array.isArray(payload.users)) return null;
+  return {
+    ...payload,
+    users: payload.users.slice(0, limit)
+  };
+}
+
+async function buildChurnLeaderboardFromMysql(limit = 10) {
   const [[row]] = await mysqlPool.execute(
     "SELECT MAX(timestamp_text) AS newest FROM log_events WHERE source_hash = ?",
     [currentSourceHash()]
@@ -1669,6 +1922,19 @@ async function churnLeaderboardFromMysql(limit = 10) {
   } finally {
     store.records = previousRecords;
   }
+}
+
+async function updateMysqlChurnCache(sourceHash, generatedAt) {
+  const payload = await buildChurnLeaderboardFromMysql(50);
+  await timedMysqlExecute(
+    "churn-cache-upsert",
+    `INSERT INTO churn_watch_cache (source_hash, payload_json, generated_at)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       payload_json = VALUES(payload_json),
+       generated_at = VALUES(generated_at)`,
+    [sourceHash, JSON.stringify(payload), generatedAt]
+  );
 }
 
 async function userChurnSummaryFromMysql(userName) {
@@ -2029,6 +2295,163 @@ async function connectedUsersSeriesFromMysql(range) {
   };
 }
 
+async function connectedUsersExport(format = "csv", range = "year") {
+  const normalizedRange = ["week", "month", "year", "all"].includes(range) ? range : "year";
+  const rows = mysqlPool
+    ? await connectedUsersExportRowsFromMysql(normalizedRange)
+    : inMemoryConnectedUsersSeries(normalizedRange === "all" ? "year" : normalizedRange).points.map((point) => ({
+      timestamp: point.timestamp,
+      connectedUsers: point.connectedUsers,
+      excludedUsers: point.excludedUsers || 0
+    }));
+  if (format === "json") {
+    return {
+      range: normalizedRange,
+      retentionDays: 365,
+      rows
+    };
+  }
+  return csv([
+    ["sampled_at", "connected_users", "excluded_users"],
+    ...rows.map((row) => [row.timestamp, row.connectedUsers, row.excludedUsers])
+  ]);
+}
+
+async function connectedUsersExportRowsFromMysql(range) {
+  const daysByRange = { week: 7, month: 31, year: 365 };
+  const where = range === "all" ? "" : "WHERE sampled_at >= UTC_TIMESTAMP() - INTERVAL ? DAY";
+  const values = range === "all" ? [] : [daysByRange[range] || 365];
+  const [rows] = await timedMysqlExecute(
+    "connected-users-export",
+    `SELECT sampled_at, connected_users, excluded_users
+     FROM connected_user_counts
+     ${where}
+     ORDER BY sampled_at`,
+    values
+  );
+  return rows.map((row) => ({
+    timestamp: new Date(row.sampled_at).toISOString(),
+    connectedUsers: Number(row.connected_users),
+    excludedUsers: Number(row.excluded_users)
+  }));
+}
+
+function csv(rows) {
+  return rows.map((row) => row.map((value) => {
+    const text = String(value ?? "");
+    return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  }).join(",")).join("\n") + "\n";
+}
+
+async function healthSummary() {
+  const memory = process.memoryUsage();
+  const statsData = mysqlLogIndexAvailable() ? await statsFromMysql() : stats();
+  const mysql = mysqlPool ? await mysqlHealth() : { enabled: false, status: mysqlStatus };
+  return {
+    status: statsData.error ? "degraded" : "ok",
+    generatedAt: new Date().toISOString(),
+    process: {
+      pid: process.pid,
+      uptimeSeconds: Math.round(process.uptime()),
+      rssBytes: memory.rss,
+      heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      node: process.version
+    },
+    config: {
+      port: PORT,
+      mysqlEnabled: MYSQL_ENABLED,
+      webIngestEnabled: WEB_INGEST_ENABLED,
+      autoRefreshMinutes: AUTO_REFRESH_MINUTES,
+      fetchConcurrency: FETCH_CONCURRENCY,
+      activeSessionMaxAgeHours: ACTIVE_SESSION_MAX_AGE_HOURS,
+      logIndexRetentionDays: LOG_INDEX_RETENTION_DAYS,
+      slowApiMs: SLOW_API_MS,
+      slowDbMs: SLOW_DB_MS
+    },
+    source: {
+      type: sourceConfig().mode,
+      description: publicSourceSettings()
+    },
+    app: {
+      loading: Boolean(refreshPromise),
+      loadedAt: statsData.loadedAt,
+      source: statsData.source,
+      error: statsData.error,
+      records: statsData.records,
+      objects: statsData.objects,
+      activeUsers: statsData.activeUsers,
+      activeSessions: statsData.activeSessions
+    },
+    mysql,
+    slowEvents: slowEvents.slice(-25).reverse()
+  };
+}
+
+async function mysqlHealth() {
+  const sourceHash = currentSourceHash();
+  const [[versionRow]] = await timedMysqlExecute("health-version", "SELECT VERSION() AS version");
+  const [tables] = await timedMysqlExecute(
+    "health-tables",
+    `SELECT table_name,
+            table_rows,
+            data_length,
+            index_length
+     FROM information_schema.tables
+     WHERE table_schema = DATABASE()
+       AND table_name IN (
+         'log_events',
+         'log_s3_objects',
+         'connected_user_counts',
+         'log_stats_cache',
+         'log_facets_cache',
+         'churn_watch_cache',
+         'active_sessions_snapshot'
+       )
+     ORDER BY table_name`
+  );
+  const [cacheRows] = await timedMysqlExecute(
+    "health-caches",
+    `SELECT 'stats' AS cache_name, MAX(generated_at) AS generated_at FROM log_stats_cache WHERE source_hash = ?
+     UNION ALL SELECT 'facets', MAX(generated_at) FROM log_facets_cache WHERE source_hash = ?
+     UNION ALL SELECT 'churn', MAX(generated_at) FROM churn_watch_cache WHERE source_hash = ?
+     UNION ALL SELECT 'active_sessions', MAX(generated_at) FROM active_sessions_snapshot WHERE source_hash = ?`,
+    [sourceHash, sourceHash, sourceHash, sourceHash]
+  );
+  const [indexRows] = await timedMysqlExecute(
+    "health-indexes",
+    `SELECT table_name, index_name
+     FROM information_schema.statistics
+     WHERE table_schema = DATABASE()
+       AND index_name IN (
+         'search_text_ft',
+         'last_modified_idx',
+         'source_time_idx',
+         'source_event_time_idx',
+         'source_user_time_idx',
+         'source_category_time_idx'
+       )
+     GROUP BY table_name, index_name
+     ORDER BY table_name, index_name`
+  );
+  return {
+    enabled: true,
+    status: mysqlStatus,
+    version: versionRow.version,
+    tables: tables.map((row) => ({
+      name: row.table_name,
+      estimatedRows: Number(row.table_rows || 0),
+      dataBytes: Number(row.data_length || 0),
+      indexBytes: Number(row.index_length || 0)
+    })),
+    caches: cacheRows.map((row) => ({
+      name: row.cache_name,
+      generatedAt: row.generated_at ? new Date(row.generated_at).toISOString() : ""
+    })),
+    indexes: indexRows.map((row) => `${row.table_name}.${row.index_name}`)
+  };
+}
+
 function inMemoryConnectedUsersSeries(range = "week") {
   const rangeConfig = {
     week: { windowHours: 24 * 7, stepMinutes: 120 },
@@ -2169,9 +2592,23 @@ function json(res, data, status = 200) {
   res.end(body);
 }
 
+function text(res, body, contentType = "text/plain; charset=utf-8", status = 200, headers = {}) {
+  res.writeHead(status, {
+    "Content-Type": contentType,
+    "Cache-Control": "no-store",
+    ...headers
+  });
+  res.end(body);
+}
+
 function html(res) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(INDEX_HTML);
+}
+
+function adminHtml(res) {
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(ADMIN_HTML);
 }
 
 function notFound(res) {
@@ -2179,8 +2616,11 @@ function notFound(res) {
 }
 
 async function handler(req, res) {
+  const start = Date.now();
+  let label = `${req.method} ${req.url || ""}`;
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    label = `${req.method} ${url.pathname}`;
     if (url.pathname === "/auth/saml/login") return samlLogin(req, res);
     if (url.pathname === "/auth/saml/callback" && req.method === "POST") return samlCallback(req, res);
     if (url.pathname === "/auth/saml/metadata") return samlMetadata(req, res);
@@ -2190,7 +2630,9 @@ async function handler(req, res) {
     }
     if (samlSettings.requireAuth && !currentUser(req).authenticated && url.pathname !== "/" && url.pathname !== "/api/auth") return json(res, { error: "Authentication required" }, 401);
     if (url.pathname === "/") return html(res);
+    if (url.pathname === "/admin") return adminHtml(res);
     if (url.pathname === "/api/auth") return json(res, { user: currentUser(req), saml: { enabled: samlConfig(req).enabled, ready: samlReady(req), requireAuth: samlConfig(req).requireAuth } });
+    if (url.pathname === "/api/health") return json(res, await healthSummary());
     if (url.pathname === "/api/settings/saml" && req.method === "GET") return json(res, publicSamlSettings(req));
     if (url.pathname === "/api/settings/saml" && req.method === "POST") {
       const nextSettings = cleanSamlSettings(await readJsonBody(req));
@@ -2215,6 +2657,15 @@ async function handler(req, res) {
       return json(res, mysqlLogIndexAvailable() ? await churnLeaderboardFromMysql(limit) : churnLeaderboard(limit));
     }
     if (url.pathname === "/api/connected-users") return json(res, await connectedUsersSeries(url.searchParams.get("range") || "week"));
+    if (url.pathname === "/api/connected-users/export") {
+      const format = (url.searchParams.get("format") || "csv").toLowerCase();
+      const requestedRange = url.searchParams.get("range") || "year";
+      const range = ["week", "month", "year", "all"].includes(requestedRange) ? requestedRange : "year";
+      if (format === "json") return json(res, await connectedUsersExport("json", range));
+      return text(res, await connectedUsersExport("csv", range), "text/csv; charset=utf-8", 200, {
+        "Content-Disposition": `attachment; filename="connected-user-counts-${range}.csv"`
+      });
+    }
     if (url.pathname === "/api/search") {
       const result = mysqlLogIndexAvailable() ? await filterRecordsFromMysql(url.searchParams) : filterRecords(url.searchParams);
       return json(res, {
@@ -2245,8 +2696,113 @@ async function handler(req, res) {
     return notFound(res);
   } catch (error) {
     json(res, { error: error.message }, 500);
+  } finally {
+    logSlow("api", label, Date.now() - start);
   }
 }
+
+const ADMIN_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenVPN Log Search Admin</title>
+  <style>
+    :root { color-scheme: light; --bg:#f7f8fb; --panel:#fff; --text:#18202b; --muted:#667085; --line:#d9dee8; --accent:#166c7d; --danger:#9f2936; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); }
+    header { min-height: 58px; padding: 12px 20px; background: #101827; color: white; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1, h2 { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 18px; }
+    h2 { font-size: 15px; }
+    a { color: inherit; }
+    main { padding: 16px; display: grid; gap: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+    .wide { grid-column: span 2; }
+    .full { grid-column: 1 / -1; }
+    .stat { display: grid; gap: 4px; }
+    .stat strong { font-size: 22px; }
+    .muted, .label { color: var(--muted); font-size: 12px; }
+    .ok { color: #166534; }
+    .bad { color: var(--danger); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; font-weight: 700; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .button { height: 34px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--accent); background: var(--accent); color: white; display: inline-flex; align-items: center; text-decoration: none; font-weight: 700; }
+    .button.secondary { background: white; color: var(--accent); }
+    @media (max-width: 1000px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .wide { grid-column: 1 / -1; } }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>OpenVPN Log Search Admin</h1>
+      <div class="muted" id="generated">Loading health...</div>
+    </div>
+    <div class="actions">
+      <a class="button secondary" href="/">Events</a>
+      <a class="button" href="/api/connected-users/export?range=year">Export Licensing CSV</a>
+    </div>
+  </header>
+  <main>
+    <section class="grid">
+      <div class="panel stat"><span class="label">Status</span><strong id="status">-</strong></div>
+      <div class="panel stat"><span class="label">Records</span><strong id="records">-</strong></div>
+      <div class="panel stat"><span class="label">Active Users</span><strong id="active">-</strong></div>
+      <div class="panel stat"><span class="label">Memory RSS</span><strong id="rss">-</strong></div>
+      <div class="panel wide"><h2>Runtime</h2><div id="runtime"></div></div>
+      <div class="panel wide"><h2>Configuration</h2><div id="config"></div></div>
+      <div class="panel wide"><h2>Cache Ages</h2><table><thead><tr><th>Cache</th><th>Generated</th><th>Age</th></tr></thead><tbody id="caches"></tbody></table></div>
+      <div class="panel wide"><h2>MariaDB Tables</h2><table><thead><tr><th>Table</th><th>Rows</th><th>Data</th><th>Index</th></tr></thead><tbody id="tables"></tbody></table></div>
+      <div class="panel full"><h2>Indexes</h2><div id="indexes"></div></div>
+      <div class="panel full"><h2>Recent Slow Calls</h2><table><thead><tr><th>Time</th><th>Kind</th><th>Label</th><th>ms</th></tr></thead><tbody id="slow"></tbody></table></div>
+    </section>
+  </main>
+  <script>
+    const fmt = new Intl.NumberFormat();
+    const bytes = value => {
+      value = Number(value || 0);
+      const units = ["B","KB","MB","GB","TB"];
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+      return (value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)) + " " + units[unit];
+    };
+    const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
+    const row = items => "<tr>" + items.map(item => "<td>" + item + "</td>").join("") + "</tr>";
+    const kv = obj => Object.entries(obj || {}).map(([key, value]) => "<div><span class='label'>" + esc(key) + "</span><br><code>" + esc(value) + "</code></div>").join("<br>");
+    const age = value => {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "-";
+      const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+      if (seconds < 60) return seconds + "s";
+      if (seconds < 3600) return Math.round(seconds / 60) + "m";
+      return Math.round(seconds / 3600) + "h";
+    };
+    async function load() {
+      const res = await fetch("/api/health");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      document.querySelector("#generated").textContent = "Generated " + new Date(data.generatedAt).toLocaleString();
+      document.querySelector("#status").textContent = data.status;
+      document.querySelector("#status").className = data.status === "ok" ? "ok" : "bad";
+      document.querySelector("#records").textContent = fmt.format(data.app.records);
+      document.querySelector("#active").textContent = fmt.format(data.app.activeUsers) + " / " + fmt.format(data.app.activeSessions);
+      document.querySelector("#rss").textContent = bytes(data.process.rssBytes);
+      document.querySelector("#runtime").innerHTML = kv({ pid: data.process.pid, uptimeSeconds: data.process.uptimeSeconds, node: data.process.node, mysql: data.mysql.status, loadedAt: data.app.loadedAt || "", source: data.app.source || "" });
+      document.querySelector("#config").innerHTML = kv(data.config);
+      document.querySelector("#caches").innerHTML = (data.mysql.caches || []).map(item => row([esc(item.name), esc(item.generatedAt || "-"), esc(age(item.generatedAt))])).join("");
+      document.querySelector("#tables").innerHTML = (data.mysql.tables || []).map(item => row([esc(item.name), fmt.format(item.estimatedRows), bytes(item.dataBytes), bytes(item.indexBytes)])).join("");
+      document.querySelector("#indexes").innerHTML = (data.mysql.indexes || []).map(item => "<code>" + esc(item) + "</code>").join(" ");
+      document.querySelector("#slow").innerHTML = (data.slowEvents || []).map(item => row([esc(new Date(item.timestamp).toLocaleString()), esc(item.kind), esc(item.label), fmt.format(item.elapsedMs)])).join("") || row(["-", "No slow calls recorded in this process", "-", "-"]);
+    }
+    load().catch(error => { document.querySelector("#status").textContent = error.message; document.querySelector("#status").className = "bad"; });
+  </script>
+</body>
+</html>`;
 
 const INDEX_HTML = `<!doctype html>
 <html lang="en">
@@ -2324,6 +2880,9 @@ const INDEX_HTML = `<!doctype html>
     .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; align-items: stretch; min-height: 0; flex: 1 1 auto; }
     .layout.detail-open { grid-template-columns: minmax(0, 1fr) minmax(320px, 380px); }
     .table-scroll { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); contain: size layout paint; }
+    .table-footer { position: sticky; left: 0; bottom: 0; display: flex; justify-content: center; padding: 10px; border-top: 1px solid var(--line); background: rgba(255,255,255,.94); }
+    .table-footer[hidden] { display: none; }
+    .table-footer button { min-width: 132px; }
     table { width: max-content; min-width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--panel); }
     th, td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
     th { color: var(--muted); background: #f1f5f9; font-size: 12px; position: sticky; top: 0; z-index: 1; user-select: none; }
@@ -2406,6 +2965,7 @@ const INDEX_HTML = `<!doctype html>
       <button type="button" class="menu-button" id="accountMenuButton" aria-haspopup="true" aria-expanded="false">Account</button>
       <div class="account-menu" role="menu">
         <div class="account-name" id="accountName">Not signed in</div>
+        <a href="/admin" role="menuitem">Admin Health</a>
         <a href="/auth/saml/login" id="loginLink" role="menuitem">Login</a>
         <a href="/auth/logout" id="logoutLink" role="menuitem">Logout</a>
         <button type="button" id="settingsButton" role="menuitem">Settings</button>
@@ -2498,6 +3058,9 @@ const INDEX_HTML = `<!doctype html>
           </thead>
           <tbody id="rows"></tbody>
         </table>
+        <div class="table-footer" id="tableFooter" hidden>
+          <button type="button" class="secondary" id="loadMore">Load More</button>
+        </div>
       </div>
       <aside class="detail-panel" id="detailPanel" hidden>
         <div class="detail-head">
@@ -2578,6 +3141,8 @@ const INDEX_HTML = `<!doctype html>
   <script>
     const filters = document.querySelector("#filters");
     const rows = document.querySelector("#rows");
+    const tableFooter = document.querySelector("#tableFooter");
+    const loadMoreButton = document.querySelector("#loadMore");
     const eventsTable = document.querySelector("#eventsTable");
     const layout = document.querySelector("#layout");
     const statusEl = document.querySelector("#status");
@@ -2638,6 +3203,8 @@ const INDEX_HTML = `<!doctype html>
     let selectedTimeZone = validTimeZone(localStorage.getItem(TIME_ZONE_STORAGE_KEY) || localTimeZone);
     if (!timeZones.includes(selectedTimeZone)) timeZones.unshift(selectedTimeZone);
     let selectedRecordId = "";
+    let nextSearchCursor = "";
+    let lastSearchMeta = { searched: 0, total: 0, totalIsExact: true, shown: 0, limit: 0 };
     let idleReloadTimer;
     let loadingPollTimer;
 
@@ -2929,10 +3496,21 @@ const INDEX_HTML = `<!doctype html>
       return zone === localTimeZone ? "Local (" + zone + ")" : zone;
     }
 
-    async function search() {
-      const data = await getJson("/api/search?" + params());
-      statusEl.textContent = (statusEl.className.includes("error") ? statusEl.textContent + " | " : "") + "searched " + data.searched + " loaded events; " + data.total + " matched; showing " + data.rows.length + " of " + data.limit;
-      rows.innerHTML = data.rows.map(record => '<tr data-id="' + esc(record.id) + '"' + (record.id === selectedRecordId ? ' class="selected"' : "") + '>' +
+    async function search(options = {}) {
+      const append = Boolean(options.append);
+      const query = params();
+      if (append && nextSearchCursor) query.set("cursor", nextSearchCursor);
+      const data = await getJson("/api/search?" + query);
+      nextSearchCursor = data.nextCursor || "";
+      lastSearchMeta = {
+        searched: data.searched,
+        total: data.total,
+        totalIsExact: data.totalIsExact !== false,
+        shown: append ? lastSearchMeta.shown + data.rows.length : data.rows.length,
+        limit: data.limit
+      };
+      renderSearchStatus(data);
+      const html = data.rows.map(record => '<tr data-id="' + esc(record.id) + '"' + (record.id === selectedRecordId ? ' class="selected"' : "") + '>' +
         '<td class="time">' + esc(displayTime(record.timestamp)) + '</td>' +
         '<td class="user wrap">' + esc(record.userName || record.initiatorName) + '</td>' +
         '<td><span class="chip">' + esc(record.eventName || record.operation || "event") + '</span></td>' +
@@ -2942,7 +3520,17 @@ const INDEX_HTML = `<!doctype html>
         '<td>' + esc(formatDuration(record.durationSeconds)) + '</td>' +
         '<td>' + esc(formatBytes((record.bytesIn || 0) + (record.bytesOut || 0))) + '</td>' +
       '</tr>').join("");
+      rows.innerHTML = append ? rows.innerHTML + html : html;
+      tableFooter.hidden = !data.hasMore;
+      loadMoreButton.disabled = !data.hasMore;
       highlightSelectedRow();
+    }
+
+    function renderSearchStatus(data) {
+      const exact = data.totalIsExact !== false;
+      const matched = exact ? data.total + " matched" : "many matched";
+      const prefix = statusEl.className.includes("error") ? statusEl.textContent + " | " : "";
+      statusEl.textContent = prefix + "searched " + data.searched + " loaded events; " + matched + "; showing " + lastSearchMeta.shown + (data.hasMore ? "+" : "") + " of " + data.limit;
     }
 
     async function selectRecord(id) {
@@ -3074,13 +3662,14 @@ const INDEX_HTML = `<!doctype html>
     });
     rows.addEventListener("click", event => {
       const tr = event.target.closest("tr");
-      if (!tr) return;
+      if (!tr || !tr.dataset.id) return;
       if (tr.dataset.id === selectedRecordId) {
         clearSelectedRecord();
       } else {
         selectRecord(tr.dataset.id).catch(showError);
       }
     });
+    loadMoreButton.addEventListener("click", () => search({ append: true }).catch(showError));
     document.querySelector("#reload").addEventListener("click", async () => {
       statusEl.textContent = "Reloading...";
       await getJson("/api/reload", { method: "POST" });

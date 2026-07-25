@@ -4,6 +4,8 @@ Small web app for authorized CloudConnexa/OpenVPN audit logs stored as gzipped J
 
 The app is designed for operational log review, not long-term raw-log warehousing. With MariaDB configured, it stores a parsed local search index and serves search, stats, and detail views from the database instead of holding the full log set in Node.js memory. It also records one year of aggregate connected-user counts for licensing analysis.
 
+See [docs/API.md](docs/API.md) for the full REST API.
+
 ## Features
 
 - Search all loaded log events, not only the currently displayed page.
@@ -60,6 +62,8 @@ AUTO_REFRESH_MINUTES=30
 ACTIVE_SESSION_MAX_AGE_HOURS=6
 WEB_INGEST_ENABLED=false
 LOG_INDEX_RETENTION_DAYS=0
+SLOW_API_MS=500
+SLOW_DB_MS=500
 
 # Log source.
 S3_FETCH_MODE=http
@@ -103,7 +107,11 @@ The parsed log index includes a MariaDB full-text index on `search_text` for key
 
 Common event-list filters use composite MariaDB indexes on source, timestamp, event name, username, and category. Search results return lean list rows; raw JSON and other detail-only data are loaded from `/api/record` only after an event is selected.
 
-The worker updates `log_stats_cache` and `active_sessions_snapshot` after each ingest. This keeps the dashboard and reload button from recomputing large event aggregates during normal UI use.
+The worker updates `log_stats_cache`, `log_facets_cache`, `churn_watch_cache`, and `active_sessions_snapshot` after each ingest. This keeps the dashboard, filters, reconnect watch, reload button, and active-session count from recomputing large event aggregates during normal UI use. Active-session snapshots are written in a batch.
+
+The event list uses cursor-based paging for Load More. Broad full-text searches skip exact match counts by default so results render quickly; exact matches for cached event, category, user, IP, or gateway values are routed to indexed column filters and still return exact counts.
+
+Slow API and database calls are logged to the service journal when they exceed `SLOW_API_MS` or `SLOW_DB_MS`, both defaulting to `500`.
 
 The aggregate count history is stored in `connected_user_counts`. Samples older than 365 days are deleted automatically.
 
@@ -147,6 +155,24 @@ npm run worker
 The web process does not run S3 ingestion by default when MariaDB is enabled. Set `WEB_INGEST_ENABLED=true` only if you intentionally want the web server to perform S3 refreshes inline.
 
 In this split mode, the Reload button returns the latest MariaDB-backed view; it does not start a full S3 ingest from the web process. The ingest worker is responsible for finding new or changed objects and refreshing the materialized stats.
+
+For systemd, keep secrets in an environment file instead of inline in the unit:
+
+```ini
+[Service]
+EnvironmentFile=/etc/openvpn-log-browser/openvpn-log-browser.env
+WorkingDirectory=/opt/openvpn-log-search
+ExecStart=/usr/bin/node /opt/openvpn-log-search/server.js
+```
+
+Protect the environment file:
+
+```bash
+sudo install -d -m 700 /etc/openvpn-log-browser
+sudo install -m 600 /dev/null /etc/openvpn-log-browser/openvpn-log-browser.env
+```
+
+Put values such as `MYSQL_PASSWORD`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` in that file.
 
 For S3 sources, reloads are incremental. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads only new or changed objects. Unchanged objects reuse their in-memory parsed records while the server stays running, the MariaDB parsed-log index after a restart, or the local S3 object cache when an object needs to be reparsed.
 
@@ -195,6 +221,38 @@ The app samples connected-user counts after log refreshes and deletes aggregate 
 The parsed log index contains normalized operational fields and raw event JSON so the app can search quickly after restart. Protect the MariaDB database as VPN log data.
 
 The parsed log index can be pruned with `LOG_INDEX_RETENTION_DAYS`. The aggregate connection-count history remains independent and is retained for one year.
+
+## Smoke Test
+
+After deployment, run:
+
+```bash
+npm run smoke
+```
+
+Set `SMOKE_BASE_URL` when testing a remote or non-default port:
+
+```bash
+SMOKE_BASE_URL=http://127.0.0.1:3017 npm run smoke
+```
+
+The smoke test checks `/api/stats`, `/api/health`, `/api/facets`, `/api/churn`, `/api/connected-users/export`, `/api/search`, cursor paging, `/api/record`, and `/admin`. It also verifies that search-list rows do not include raw JSON or `searchText`.
+
+## Admin Health And Licensing Export
+
+Open `/admin` for an operational health page showing process memory, runtime config, source status, current indexed counts, MariaDB table sizes, cache ages, expected indexes, and recent slow API/DB calls observed by the web process.
+
+Export the one-year licensing history as CSV:
+
+```bash
+curl -o connected-user-counts.csv http://127.0.0.1:3017/api/connected-users/export?range=year
+```
+
+JSON is also available:
+
+```bash
+curl http://127.0.0.1:3017/api/connected-users/export?range=year\&format=json
+```
 
 ## S3 Bucket Access
 

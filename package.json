@@ -12,6 +12,7 @@
     "start": "node server.js",
     "ingest": "node server.js --ingest",
     "worker": "node server.js --worker",
+    "smoke": "node scripts/smoke-test.js",
     "dev": "node server.js"
   },
   "engines": {
