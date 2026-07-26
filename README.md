@@ -1,19 +1,42 @@
 # OpenVPN Log Search
 
-Small, dependency-free web app for authorized CloudConnexa/OpenVPN audit logs stored as gzipped JSONL in S3.
+Small web app for authorized CloudConnexa/OpenVPN audit logs stored as gzipped JSONL in S3.
+
+The app is designed for operational log review, not long-term raw-log warehousing. With MariaDB configured, it stores a parsed local search index and serves search, stats, and detail views from the database instead of holding the full log set in Node.js memory. It also records one year of aggregate connected-user counts for licensing analysis.
+
+See [docs/API.md](docs/API.md) for the full REST API.
+
+## Features
+
+- Search all loaded log events, not only the currently displayed page.
+- Filter by category, event type, operating system, gateway, date range, and row limit.
+- Resize event-list columns; widths are remembered in browser storage.
+- View active users/sessions after excluding reconnect-heavy users from active-session counts.
+- Track connected users over time with week, month, and year ranges.
+- Show a compact Reconnect Watch for users with excessive connect/disconnect churn.
+- Click a Reconnect Watch username to put that user in the Search field and filter events.
+- Open Event Detail only when needed. Click an event to show details; click the same event again, or the X, to hide details and return the event list to full width.
+- Display timestamps in the timezone selected from `Menu` -> `Settings`.
+- Configure optional SAML 2.0 SSO from environment variables or `Menu` -> `Settings`.
+- Choose HTTP bucket listing or S3 API with IAM credentials from `Menu` -> `Settings`.
+- Reload S3 logs incrementally by reusing unchanged objects while the server process stays running.
+- Redact secret-like keys in raw event display.
 
 ## Run
 
 ```powershell
-node server.js
+npm install
+npm start
 ```
 
 Then open `http://localhost:3000`.
 
+Node.js 18 or newer is required for SAML 2.0 SSO support.
+
 You can also verify ingestion without starting the web server:
 
 ```powershell
-node server.js --ingest
+npm run ingest
 ```
 
 By default the app reads from:
@@ -22,17 +45,32 @@ By default the app reads from:
 https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
 ```
 
-If the current machine cannot list the bucket, run it on `ospf1` or place `.jsonl.gz` files under `data/raw/` and start again.
+If the current machine cannot list the bucket, run it from any authorized host with S3 access or place `.jsonl.gz` files under `data/raw/` and start again.
 
 ## Environment
 
 ```text
 PORT=3000
-S3_BUCKET_URL=https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
-LOG_PREFIX=CloudConnexa/wellesley/
 RAW_DIR=data/raw
+S3_CACHE_DIR=data/s3-cache
+SETTINGS_DIR=data/settings
+SAML_SETTINGS_PATH=data/settings/saml.json
+SOURCE_SETTINGS_PATH=data/settings/source.json
+FETCH_CONCURRENCY=32
+LOAD_BATCH_DELAY_MS=0
 AUTO_REFRESH_MINUTES=30
-ACTIVE_SESSION_MAX_AGE_HOURS=72
+ACTIVE_SESSION_MAX_AGE_HOURS=6
+WEB_INGEST_ENABLED=false
+LOG_INDEX_RETENTION_DAYS=0
+SLOW_API_MS=500
+SLOW_DB_MS=500
+
+# Log source.
+S3_FETCH_MODE=http
+S3_BUCKET_URL=https://<BUCKET-NAME>.s3.us-east-1.amazonaws.com/
+S3_BUCKET_NAME=<BUCKET-NAME>
+AWS_REGION=us-east-1
+LOG_PREFIX=CloudConnexa/<CLOUD-ID>/
 
 # Optional MySQL aggregate count storage.
 MYSQL_HOST=127.0.0.1
@@ -40,16 +78,181 @@ MYSQL_PORT=3306
 MYSQL_USER=openvpn_log_browser
 MYSQL_PASSWORD=<password>
 MYSQL_DATABASE=openvpn_log_browser
+
+# Optional SAML 2.0 SSO.
+SAML_ENABLED=false
+SAML_REQUIRE_AUTH=false
+SAML_SP_ENTITY_ID=openvpn-log-browser
+SAML_CALLBACK_URL=https://logs.example.com/auth/saml/callback
+SAML_ENTRY_POINT=https://idp.example.com/sso/saml
+SAML_LOGOUT_URL=https://idp.example.com/slo/saml
+SAML_IDP_CERT=<idp signing certificate>
+SAML_AUDIENCE=
+SAML_WANT_ASSERTIONS_SIGNED=true
+SAML_WANT_RESPONSE_SIGNED=false
+SAML_DISABLE_REQUESTED_AUTHN_CONTEXT=true
 ```
 
-When MySQL is configured, the app stores only aggregate licensing telemetry:
+When MySQL/MariaDB is configured, the app uses it for two local caches:
 
-- sample timestamp
-- connected user count
-- excluded reconnect-heavy user count
+- parsed, normalized log events keyed by S3 object fingerprint
+- worker-maintained dashboard stats and active-session snapshots
+- aggregate connected-user counts for licensing trend analysis
 
-The `connected_user_counts` table contains only those three columns.
-No usernames, IPs, session IDs, raw logs, or event payloads are written to MySQL. Samples older than 365 days are deleted automatically.
+The parsed log index lets the app restart quickly without reparsing every `.jsonl.gz` object. S3 remains the source of truth; new or changed S3 objects are downloaded, parsed, and upserted into MariaDB.
+
+When the parsed log index is available, search, stats, facets, record detail, and reconnect summaries are served from MariaDB instead of hydrating every event into Node.js memory.
+
+The parsed log index includes a MariaDB full-text index on `search_text` for keyword searches.
+
+Common event-list filters use composite MariaDB indexes on source, timestamp, event name, username, and category. Search results return lean list rows; raw JSON and other detail-only data are loaded from `/api/record` only after an event is selected.
+
+The worker updates `log_stats_cache`, `log_facets_cache`, `churn_watch_cache`, and `active_sessions_snapshot` after each ingest. This keeps the dashboard, filters, reconnect watch, reload button, and active-session count from recomputing large event aggregates during normal UI use. Active-session snapshots are written in a batch.
+
+The event list uses cursor-based paging for Load More. Broad full-text searches skip exact match counts by default so results render quickly; exact matches for cached event, category, user, IP, or gateway values are routed to indexed column filters and still return exact counts.
+
+Slow API and database calls are logged to the service journal when they exceed `SLOW_API_MS` or `SLOW_DB_MS`, both defaulting to `500`.
+
+The aggregate count history is stored in `connected_user_counts`. Samples older than 365 days are deleted automatically.
+
+SAML settings can also be managed in the app from `Menu` -> `Settings`. The app exposes SP metadata at `/auth/saml/metadata` after SAML is configured.
+
+## Log Source Settings
+
+The setup menu supports two S3 fetch modes:
+
+- `HTTP bucket listing` uses `S3_BUCKET_URL` and bucket policy/source-IP access.
+- `S3 API with IAM credentials` uses `S3_BUCKET_NAME`, `AWS_REGION`, and the standard AWS SDK credential chain.
+
+AWS secrets are not stored by the setup menu. If you use S3 API mode outside AWS, put credentials in the service environment file, for example:
+
+```bash
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+```
+
+If the app runs on EC2, prefer an instance role instead of access keys. The role or IAM user only needs `s3:ListBucket` for the bucket and `s3:GetObject` for the CloudConnexa log prefix.
+
+Changing the log source in `Menu` -> `Settings` saves `data/settings/source.json`. Use Reload, restart the service, or wait for the next refresh to load from the new source.
+
+## Refresh Behavior
+
+The app refreshes logs in three ways:
+
+- Click `Reload` in the UI.
+- POST to `/api/reload`.
+- Let the automatic 30-minute refresh run.
+
+`AUTO_REFRESH_MINUTES` controls the ingest worker interval and the browser idle refresh timer. The default is `30`. Set it to `0` to disable the browser idle refresh timer; the worker treats `0` as a 30-minute loop interval.
+
+When MariaDB is configured, run ingestion separately from the web process:
+
+```powershell
+npm run worker
+```
+
+The web process does not run S3 ingestion by default when MariaDB is enabled. Set `WEB_INGEST_ENABLED=true` only if you intentionally want the web server to perform S3 refreshes inline.
+
+In this split mode, the Reload button returns the latest MariaDB-backed view; it does not start a full S3 ingest from the web process. The ingest worker is responsible for finding new or changed objects and refreshing the materialized stats.
+
+For systemd, keep secrets in an environment file instead of inline in the unit:
+
+```ini
+[Service]
+EnvironmentFile=/etc/openvpn-log-browser/openvpn-log-browser.env
+WorkingDirectory=/opt/openvpn-log-search
+ExecStart=/usr/bin/node /opt/openvpn-log-search/server.js
+```
+
+Protect the environment file:
+
+```bash
+sudo install -d -m 700 /etc/openvpn-log-browser
+sudo install -m 600 /dev/null /etc/openvpn-log-browser/openvpn-log-browser.env
+```
+
+Put values such as `MYSQL_PASSWORD`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` in that file.
+
+For S3 sources, reloads are incremental. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads only new or changed objects. Unchanged objects reuse their in-memory parsed records while the server stays running, the MariaDB parsed-log index after a restart, or the local S3 object cache when an object needs to be reparsed.
+
+The local S3 object cache is stored under `S3_CACHE_DIR`, which defaults to `data/s3-cache` inside the app directory. The cache stores gzipped log objects and `manifest.json`; protect this directory like VPN logs. It is ignored by Git.
+
+After a service restart, the app hydrates from the MariaDB parsed-log index first, then refreshes S3 in the background. If MariaDB has no indexed copy of an unchanged object yet, the loader parses from the local S3 object cache where possible and only downloads objects missing from disk or changed in S3.
+
+`FETCH_CONCURRENCY` controls how many new or changed S3 objects are downloaded in parallel. The default is `32`. Increase it only if the VM has spare CPU and memory; lower it if Node uses too much CPU or RSS during a cold load.
+
+`LOG_INDEX_RETENTION_DAYS` optionally prunes parsed log rows and indexed S3 object fingerprints older than the selected number of days. The default `0` keeps the parsed index until S3/source changes or you clean it manually. This does not affect `connected_user_counts`, which keeps one year of aggregate count history.
+
+## Interface Notes
+
+The main screen is split into a compact dashboard, filters, and the event list:
+
+- `Active users` shows users and sessions whose latest connection-state event is connected and newer than `ACTIVE_SESSION_MAX_AGE_HOURS`.
+- `Connected Users Over Time` shows aggregate connected-user counts. If MySQL is configured it reads the retained one-year count history; otherwise it derives the visible series from the loaded logs.
+- `Reconnect Watch` shows the highest churn users in the last 24 hours. Each username is clickable and runs an event search for that user.
+- The event table uses the full available width until an event is selected.
+- Selecting an event opens the Event Detail pane. Selecting the same event again closes it.
+- Event Detail includes normalized fields, a per-user reconnect summary, and redacted raw JSON.
+
+Use `Menu` -> `Settings` for timezone and SAML configuration. The timezone selection affects displayed timestamps in the dashboard, table, and detail pane.
+
+## MariaDB Storage
+
+MySQL/MariaDB is optional. When configured, it creates and maintains a parsed log index:
+
+```sql
+log_s3_objects(source_hash, object_hash, object_key, fingerprint, parsed_at, record_count, ...)
+log_events(id_hash, source_hash, object_hash, timestamp_dt, user_name, public_ip, raw_json, ...)
+```
+
+It also creates and maintains the aggregate count table:
+
+```sql
+CREATE TABLE IF NOT EXISTS connected_user_counts (
+  sampled_at DATETIME NOT NULL PRIMARY KEY,
+  connected_users INT NOT NULL,
+  excluded_users INT NOT NULL
+);
+```
+
+The app samples connected-user counts after log refreshes and deletes aggregate samples older than 365 days. This is intended for license-sizing trend analysis only.
+
+The parsed log index contains normalized operational fields and raw event JSON so the app can search quickly after restart. Protect the MariaDB database as VPN log data.
+
+The parsed log index can be pruned with `LOG_INDEX_RETENTION_DAYS`. The aggregate connection-count history remains independent and is retained for one year.
+
+## Smoke Test
+
+After deployment, run:
+
+```bash
+npm run smoke
+```
+
+Set `SMOKE_BASE_URL` when testing a remote or non-default port:
+
+```bash
+SMOKE_BASE_URL=http://127.0.0.1:3017 npm run smoke
+```
+
+The smoke test checks `/api/stats`, `/api/health`, `/api/facets`, `/api/churn`, `/api/connected-users/export`, `/api/search`, cursor paging, `/api/record`, and `/admin`. It also verifies that search-list rows do not include raw JSON or `searchText`.
+
+## Admin Health And Licensing Export
+
+Open `/admin` for an operational health page showing process memory, runtime config, source status, current indexed counts, MariaDB table sizes, cache ages, expected indexes, and recent slow API/DB calls observed by the web process.
+
+Export the one-year licensing history as CSV:
+
+```bash
+curl -o connected-user-counts.csv http://127.0.0.1:3017/api/connected-users/export?range=year
+```
+
+JSON is also available:
+
+```bash
+curl http://127.0.0.1:3017/api/connected-users/export?range=year\&format=json
+```
 
 ## S3 Bucket Access
 
@@ -131,7 +334,10 @@ Security note: IP-based bucket policies are useful for a small internal tool, bu
 ## Notes
 
 - The app keeps logs in memory for fast filtering.
-- Search checks common fields and raw JSON.
+- S3 reloads keep a per-object parsed-record cache in memory, a MariaDB parsed-log index when configured, and a gzipped object cache under `data/s3-cache`.
+- Search checks normalized fields and raw JSON across the full loaded log set.
 - Connection logs are normalized into user, device, public IP, tunnel IP, OS, gateway, protocol, session ID, duration, transfer volume, and disconnect reason.
+- The event list displays normalized operational fields and can be searched by username, IP, device, operation, gateway, trace ID, and other common fields.
 - Display redacts secret-like keys such as `token`, `secret`, `password`, and `privateKey`.
 - It does not redact ordinary operational fields such as username, email, timestamp, and IP address because those are the point of the admin search workflow.
+- Log refresh can be triggered with the Reload button, the `/api/reload` endpoint, the server refresh interval, or the browser idle refresh timer.

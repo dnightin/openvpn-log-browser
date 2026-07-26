@@ -4,14 +4,18 @@
   "private": true,
   "description": "Search authorized OpenVPN CloudConnexa JSONL logs from S3 or local cache.",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.812.0",
+    "@node-saml/node-saml": "^5.1.0",
     "mysql2": "^3.11.5"
   },
   "scripts": {
     "start": "node server.js",
     "ingest": "node server.js --ingest",
+    "worker": "node server.js --worker",
+    "smoke": "node scripts/smoke-test.js",
     "dev": "node server.js"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=18"
   }
 }
