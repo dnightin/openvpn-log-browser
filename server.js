@@ -2049,14 +2049,16 @@ async function buildStatsFromMysql(timeZone = "UTC") {
   const displayTimeZone = normalizeTimeZone(timeZone);
   const [[summary]] = await mysqlPool.execute(
     `SELECT COUNT(*) AS records,
-            MIN(timestamp_text) AS firstTimestamp,
-            MAX(timestamp_text) AS lastTimestamp,
+            MIN(timestamp_dt) AS firstTimestampDt,
+            MAX(timestamp_dt) AS lastTimestampDt,
             COALESCE(SUM(bytes_in), 0) AS totalBytesIn,
             COALESCE(SUM(bytes_out), 0) AS totalBytesOut
      FROM log_events
      WHERE source_hash = ?`,
     [sourceHash]
   );
+  summary.firstTimestamp = summary.firstTimestampDt ? new Date(summary.firstTimestampDt).toISOString() : "";
+  summary.lastTimestamp = summary.lastTimestampDt ? new Date(summary.lastTimestampDt).toISOString() : "";
   const [[objectsRow]] = await mysqlPool.execute(
     "SELECT COUNT(*) AS objects FROM log_s3_objects WHERE source_hash = ?",
     [sourceHash]
@@ -2210,10 +2212,10 @@ async function latestActiveConnectionsFromMysql(atTime = Date.now()) {
 
 async function connectedUsersSnapshotFromMysql() {
   const [[row]] = await mysqlPool.execute(
-    "SELECT MAX(timestamp_text) AS newest FROM log_events WHERE source_hash = ?",
+    "SELECT MAX(timestamp_dt) AS newest FROM log_events WHERE source_hash = ?",
     [currentSourceHash()]
   );
-  const newest = row.newest ? Date.parse(row.newest) : Date.now();
+  const newest = row.newest ? new Date(row.newest).getTime() : Date.now();
   const cutoff = newest - (24 * 60 * 60 * 1000);
   const excludedUsers = await excessiveReconnectUsersFromMysql(newest, cutoff);
   const activeRows = (await activeConnectionsSnapshotFromMysql(newest)).filter((session) => !excludedUsers.has(session.userName));
@@ -2271,10 +2273,10 @@ async function cachedChurnLeaderboardFromMysql(limit = 10) {
 
 async function buildChurnLeaderboardFromMysql(limit = 10) {
   const [[row]] = await mysqlPool.execute(
-    "SELECT MAX(timestamp_text) AS newest FROM log_events WHERE source_hash = ?",
+    "SELECT MAX(timestamp_dt) AS newest FROM log_events WHERE source_hash = ?",
     [currentSourceHash()]
   );
-  const newest = row.newest ? Date.parse(row.newest) : Date.now();
+  const newest = row.newest ? new Date(row.newest).getTime() : Date.now();
   const cutoff = newest - (24 * 60 * 60 * 1000);
   const records = await connectionRecordsFromMysqlSince(cutoff);
   return churnLeaderboard(limit, records);
@@ -2296,18 +2298,18 @@ async function updateMysqlChurnCache(sourceHash, generatedAt) {
 async function userChurnSummaryFromMysql(userName) {
   if (!userName) return userChurnSummary(userName);
   const [[row]] = await mysqlPool.execute(
-    "SELECT MAX(timestamp_text) AS newest FROM log_events WHERE source_hash = ?",
+    "SELECT MAX(timestamp_dt) AS newest FROM log_events WHERE source_hash = ?",
     [currentSourceHash()]
   );
-  const newest = row.newest ? Date.parse(row.newest) : Date.now();
+  const newest = row.newest ? new Date(row.newest).getTime() : Date.now();
   const cutoff = newest - (24 * 60 * 60 * 1000);
   const [rows] = await mysqlPool.execute(
     `${mysqlRecordSelect(false)}
      WHERE source_hash = ?
        AND timestamp_dt >= ?
-       AND (user_name = ? OR parent_entity_name = ? OR initiator_name = ?)
+       AND user_name = ?
      ORDER BY timestamp_dt DESC, id_hash DESC`,
-    [currentSourceHash(), mysqlDate(new Date(cutoff)), userName, userName, userName]
+    [currentSourceHash(), mysqlDate(new Date(cutoff)), userName]
   );
   return userChurnSummary(userName, rows.map(mysqlRowToRecord));
 }

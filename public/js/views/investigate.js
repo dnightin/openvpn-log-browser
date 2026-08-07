@@ -122,7 +122,8 @@ export async function mount(root, routeParams) {
     order: "desc",
     cursor: "",
     selectedId: "",
-    activeTab: "normalized"
+    activeTab: "normalized",
+    detailRequestId: 0
   };
 
   root.innerHTML =
@@ -357,10 +358,26 @@ export async function mount(root, routeParams) {
 
   async function selectRecord(id) {
     state.selectedId = id;
+    state.detailRequestId += 1;
+    const requestId = state.detailRequestId;
     highlightSelectedRow();
     const panel = ensureDetailPanel();
     layout.classList.add("detail-open");
-    const record = await api.getRecord(id);
+    panel.querySelector('[data-pane="normalized"]').innerHTML = '<div class="muted">Loading...</div>';
+    panel.querySelector('[data-pane="raw"]').innerHTML = '<div class="muted">Loading...</div>';
+    panel.querySelector('[data-pane="churn"]').innerHTML = '<div class="muted">Loading...</div>';
+    let record;
+    try {
+      record = await api.getRecord(id);
+    } catch (error) {
+      if (requestId !== state.detailRequestId) return;
+      const message = '<div class="status-line error">' + esc(error.message) + "</div>";
+      panel.querySelector('[data-pane="normalized"]').innerHTML = message;
+      panel.querySelector('[data-pane="raw"]').innerHTML = message;
+      panel.querySelector('[data-pane="churn"]').innerHTML = message;
+      return;
+    }
+    if (requestId !== state.detailRequestId) return;
     const normalized =
       kv("Timestamp", displayTime(record.timestamp, timeZone)) +
       kv("Event", record.eventName || record.operation) +
