@@ -82,6 +82,16 @@ async function main() {
   assert(record.data.raw && typeof record.data.raw === "object", "record.raw is missing");
   checks.push(["record", record.elapsedMs]);
 
+  const query = await getJson("/api/query?eventName=client-connected&sort=timestamp&order=desc&fields=timestamp,userName&limit=2");
+  assert(Array.isArray(query.data.rows), "query.rows is missing");
+  assert(query.data.rows.length > 0, "query returned no rows");
+  assert(Object.keys(query.data.rows[0]).sort().join(",") === "id,timestamp,userName", `query row has unexpected fields: ${Object.keys(query.data.rows[0]).join(",")}`);
+  checks.push(["query", query.elapsedMs]);
+
+  const queryBadParam = await fetch(`${baseUrl}/api/query?notAField=1`);
+  assert(queryBadParam.status === 400, `query with unknown param should 400, got ${queryBadParam.status}`);
+  checks.push(["query-validation", 0]);
+
   for (const [name, elapsedMs] of checks) {
     console.log(`${name}: ${elapsedMs}ms`);
   }

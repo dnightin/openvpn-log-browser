@@ -1493,6 +1493,306 @@ function mysqlBooleanSearchQuery(value) {
   return terms.slice(0, 12).map((term) => `+${term}${term.length >= 3 ? "*" : ""}`).join(" ");
 }
 
+// Field map for the general-purpose /api/query endpoint. Keys are the only accepted
+// API field names; column/type values are fixed and never derived from user input, so
+// this doubles as an allowlist for building safe dynamic SQL (WHERE/ORDER BY/SELECT).
+const QUERY_FIELDS = {
+  id: { column: "id", type: "string" },
+  sourceKey: { column: "source_key", type: "string" },
+  lineNumber: { column: "line_number", type: "number" },
+  timestamp: { column: "timestamp_text", type: "date" },
+  date: { column: "date_text", type: "string" },
+  category: { column: "category", type: "string" },
+  eventName: { column: "event_name", type: "string" },
+  initiator: { column: "initiator", type: "string" },
+  initiatorName: { column: "initiator_name", type: "string" },
+  userName: { column: "user_name", type: "string" },
+  deviceName: { column: "device_name", type: "string" },
+  initiatorType: { column: "initiator_type", type: "string" },
+  publicIp: { column: "public_ip", type: "string" },
+  operation: { column: "operation_name", type: "string" },
+  entityType: { column: "entity_type", type: "string" },
+  entityName: { column: "entity_name", type: "string" },
+  parentEntityName: { column: "parent_entity_name", type: "string" },
+  sessionId: { column: "session_id", type: "string" },
+  protocol: { column: "protocol_name", type: "string" },
+  gateway: { column: "gateway", type: "string" },
+  gatewayRegion: { column: "gateway_region", type: "string" },
+  os: { column: "os", type: "string" },
+  tunnelIp: { column: "tunnel_ip", type: "string" },
+  tunnelIpV4: { column: "tunnel_ip_v4", type: "string" },
+  tunnelIpV6: { column: "tunnel_ip_v6", type: "string" },
+  sessionStartTime: { column: "session_start_time", type: "string" },
+  sessionEndTime: { column: "session_end_time", type: "string" },
+  durationSeconds: { column: "duration_seconds", type: "number" },
+  bytesIn: { column: "bytes_in", type: "number" },
+  bytesOut: { column: "bytes_out", type: "number" },
+  disconnectReason: { column: "disconnect_reason", type: "string" },
+  traceId: { column: "trace_id", type: "string" },
+  userAgent: { column: "user_agent", type: "string" }
+};
+const QUERY_DEFAULT_FIELDS = Object.keys(QUERY_FIELDS);
+// Exact-match, comma-separated multi-value filters (?userName=a,b -> IN (a,b)). "os" is
+// handled separately below as a prefix match since it stores "Windows 10.0.19045" style values.
+const QUERY_MULTI_VALUE_FIELDS = new Set([
+  "sourceKey", "category", "eventName", "initiator", "initiatorName", "userName", "deviceName",
+  "initiatorType", "publicIp", "operation", "entityType", "entityName", "parentEntityName",
+  "sessionId", "protocol", "gateway", "gatewayRegion", "tunnelIp", "tunnelIpV4", "tunnelIpV6",
+  "disconnectReason", "traceId"
+]);
+const QUERY_RANGE_NUMERIC_FIELDS = new Set(["durationSeconds", "bytesIn", "bytesOut"]);
+const QUERY_RESERVED_PARAMS = new Set([
+  "q", "start", "end", "sort", "order", "fields", "includeRaw", "limit", "offset", "cursor", "format"
+]);
+
+function knownQueryParamNames() {
+  const names = new Set(QUERY_RESERVED_PARAMS);
+  for (const field of QUERY_MULTI_VALUE_FIELDS) names.add(field);
+  names.add("os");
+  for (const field of QUERY_RANGE_NUMERIC_FIELDS) {
+    names.add(`${field}Min`);
+    names.add(`${field}Max`);
+  }
+  return names;
+}
+
+function parseMultiValue(value) {
+  return String(value || "").split(",").map((part) => part.trim()).filter(Boolean);
+}
+
+function parseQuerySpec(params) {
+  const errors = [];
+  const known = knownQueryParamNames();
+  for (const key of params.keys()) {
+    if (!known.has(key)) errors.push(`Unknown query parameter: ${key}`);
+  }
+
+  const filters = [];
+  for (const field of QUERY_MULTI_VALUE_FIELDS) {
+    const raw = params.get(field);
+    if (raw) filters.push({ field, kind: "multi", values: parseMultiValue(raw) });
+  }
+  const osRaw = params.get("os");
+  if (osRaw) filters.push({ field: "os", kind: "prefix", values: parseMultiValue(osRaw) });
+
+  const numericRanges = {};
+  for (const field of QUERY_RANGE_NUMERIC_FIELDS) {
+    const minRaw = params.get(`${field}Min`);
+    const maxRaw = params.get(`${field}Max`);
+    if (minRaw) {
+      const n = Number(minRaw);
+      if (Number.isFinite(n)) numericRanges[field] = { ...numericRanges[field], min: n };
+      else errors.push(`${field}Min must be a number`);
+    }
+    if (maxRaw) {
+      const n = Number(maxRaw);
+      if (Number.isFinite(n)) numericRanges[field] = { ...numericRanges[field], max: n };
+      else errors.push(`${field}Max must be a number`);
+    }
+  }
+
+  const sortField = params.get("sort") || "timestamp";
+  if (!QUERY_FIELDS[sortField]) errors.push(`sort must be one of: ${QUERY_DEFAULT_FIELDS.join(", ")}`);
+  const orderRaw = (params.get("order") || "desc").toLowerCase();
+  const order = orderRaw === "asc" || orderRaw === "desc" ? orderRaw : null;
+  if (!order) errors.push("order must be 'asc' or 'desc'");
+
+  let fields = QUERY_DEFAULT_FIELDS;
+  const fieldsRaw = params.get("fields");
+  if (fieldsRaw) {
+    const requested = parseMultiValue(fieldsRaw);
+    const unknown = requested.filter((field) => !QUERY_FIELDS[field]);
+    if (unknown.length) errors.push(`Unknown field(s) in 'fields': ${unknown.join(", ")}`);
+    fields = [...new Set(["id", ...requested])];
+  }
+
+  const format = (params.get("format") || "json").toLowerCase() === "csv" ? "csv" : "json";
+
+  return {
+    errors,
+    filters,
+    q: (params.get("q") || "").trim(),
+    start: params.get("start") || "",
+    end: params.get("end") || "",
+    numericRanges,
+    sortField: QUERY_FIELDS[sortField] ? sortField : "timestamp",
+    order: order || "desc",
+    fields,
+    includeRaw: toBool(params.get("includeRaw")),
+    limit: Math.min(Math.max(1, Number(params.get("limit")) || 1000), 20000),
+    offset: Math.max(0, Number(params.get("offset")) || 0),
+    cursor: params.get("cursor") || "",
+    format
+  };
+}
+
+function projectRecord(record, fields, includeRaw) {
+  const out = {};
+  for (const field of fields) out[field] = record[field];
+  if (includeRaw) out.raw = redact(record.raw || {});
+  return out;
+}
+
+function buildQueryWhereMysql(spec, sourceHash) {
+  const where = ["source_hash = ?"];
+  const values = [sourceHash];
+  for (const filter of spec.filters) {
+    const column = QUERY_FIELDS[filter.field].column;
+    if (filter.kind === "multi") {
+      where.push(`${column} IN (${filter.values.map(() => "?").join(",")})`);
+      values.push(...filter.values);
+    } else if (filter.kind === "prefix") {
+      where.push(`(${filter.values.map(() => `${column} LIKE ?`).join(" OR ")})`);
+      values.push(...filter.values.map((value) => `${value}%`));
+    }
+  }
+  if (spec.q) {
+    if (mysqlFullTextReady) {
+      where.push("MATCH(search_text) AGAINST (? IN BOOLEAN MODE)");
+      values.push(mysqlBooleanSearchQuery(spec.q));
+    } else {
+      where.push("search_text LIKE ?");
+      values.push(`%${spec.q.toLowerCase()}%`);
+    }
+  }
+  if (spec.start) {
+    const startDate = mysqlDateOrNull(spec.start);
+    if (startDate) { where.push("timestamp_dt >= ?"); values.push(startDate); }
+    else { where.push("timestamp_text >= ?"); values.push(spec.start); }
+  }
+  if (spec.end) {
+    const endDate = mysqlDateOrNull(spec.end);
+    if (endDate) { where.push("timestamp_dt <= ?"); values.push(endDate); }
+    else { where.push("timestamp_text <= ?"); values.push(spec.end); }
+  }
+  for (const [field, range] of Object.entries(spec.numericRanges)) {
+    const column = QUERY_FIELDS[field].column;
+    if (range.min !== undefined) { where.push(`${column} >= ?`); values.push(range.min); }
+    if (range.max !== undefined) { where.push(`${column} <= ?`); values.push(range.max); }
+  }
+  return { sql: where.join(" AND "), values };
+}
+
+async function runQueryFromMysql(spec) {
+  const sourceHash = currentSourceHash();
+  const { sql, values } = buildQueryWhereMysql(spec, sourceHash);
+  const searched = await mysqlIndexedRecordCount(sourceHash);
+  const total = await mysqlSearchCount(sql, values);
+
+  const useCursor = Boolean(spec.cursor) && spec.sortField === "timestamp" && spec.order === "desc";
+  const orderDir = spec.order.toUpperCase();
+  const orderSql = spec.sortField === "timestamp"
+    ? `timestamp_dt ${orderDir}, id_hash ${orderDir}`
+    : `${QUERY_FIELDS[spec.sortField].column} ${orderDir}, timestamp_dt DESC, id_hash DESC`;
+
+  let whereSql = sql;
+  const whereValues = [...values];
+  if (useCursor) {
+    const cursor = decodeSearchCursor(spec.cursor);
+    const cursorDate = cursor ? mysqlDateOrNull(cursor.timestamp) : null;
+    if (cursorDate && cursor.idHash) {
+      whereSql += " AND (timestamp_dt < ? OR (timestamp_dt = ? AND id_hash < ?))";
+      whereValues.push(cursorDate, cursorDate, cursor.idHash);
+    }
+  }
+
+  const limitSql = !useCursor && spec.offset ? "LIMIT ? OFFSET ?" : "LIMIT ?";
+  const limitValues = !useCursor && spec.offset ? [spec.limit + 1, spec.offset] : [spec.limit + 1];
+
+  const [rows] = await timedMysqlExecute(
+    "query",
+    `${mysqlRecordSelect(spec.includeRaw)} WHERE ${whereSql} ORDER BY ${orderSql} ${limitSql}`,
+    [...whereValues, ...limitValues]
+  );
+  const hasMore = rows.length > spec.limit;
+  const records = rows.slice(0, spec.limit).map(mysqlRowToRecord);
+  return {
+    searched,
+    total,
+    limit: spec.limit,
+    offset: spec.offset,
+    hasMore,
+    nextCursor: spec.sortField === "timestamp" && spec.order === "desc" && hasMore ? encodeSearchCursor(records[records.length - 1]) : "",
+    rows: records.map((record) => projectRecord(record, spec.fields, spec.includeRaw))
+  };
+}
+
+function matchesQuerySpec(record, spec) {
+  for (const filter of spec.filters) {
+    const value = String(record[filter.field] ?? "");
+    if (filter.kind === "multi") {
+      if (!filter.values.includes(value)) return false;
+    } else if (filter.kind === "prefix") {
+      if (!filter.values.some((prefix) => value.startsWith(prefix))) return false;
+    }
+  }
+  if (spec.q && !record.searchText.includes(spec.q.toLowerCase())) return false;
+  if (spec.start && record.timestamp < spec.start) return false;
+  if (spec.end && record.timestamp > spec.end) return false;
+  for (const [field, range] of Object.entries(spec.numericRanges)) {
+    const value = Number(record[field] || 0);
+    if (range.min !== undefined && value < range.min) return false;
+    if (range.max !== undefined && value > range.max) return false;
+  }
+  return true;
+}
+
+function queryComparator(field, order) {
+  const meta = QUERY_FIELDS[field];
+  const dir = order === "asc" ? 1 : -1;
+  return (a, b) => {
+    let result;
+    if (meta.type === "number") result = (Number(a[field]) || 0) - (Number(b[field]) || 0);
+    else if (meta.type === "date") result = (Date.parse(a[field]) || 0) - (Date.parse(b[field]) || 0);
+    else result = String(a[field] || "").localeCompare(String(b[field] || ""));
+    if (result === 0) result = String(a.id).localeCompare(String(b.id));
+    return result * dir;
+  };
+}
+
+function runQueryFromMemory(spec) {
+  const searched = store.records.length;
+  const matched = store.records.filter((record) => matchesQuerySpec(record, spec));
+  const total = matched.length;
+  matched.sort(queryComparator(spec.sortField, spec.order));
+
+  const useCursor = Boolean(spec.cursor) && spec.sortField === "timestamp" && spec.order === "desc";
+  let sliceStart = spec.offset;
+  if (useCursor) {
+    const cursor = decodeSearchCursor(spec.cursor);
+    const idx = cursor ? matched.findIndex((record) => hashId(record.id) === cursor.idHash) : -1;
+    sliceStart = idx >= 0 ? idx + 1 : 0;
+  }
+  const page = matched.slice(sliceStart, sliceStart + spec.limit + 1);
+  const hasMore = page.length > spec.limit;
+  const pageRecords = page.slice(0, spec.limit);
+  return {
+    searched,
+    total,
+    limit: spec.limit,
+    offset: spec.offset,
+    hasMore,
+    nextCursor: spec.sortField === "timestamp" && spec.order === "desc" && hasMore ? encodeSearchCursor(pageRecords[pageRecords.length - 1]) : "",
+    rows: pageRecords.map((record) => projectRecord(record, spec.fields, spec.includeRaw))
+  };
+}
+
+async function handleQuery(req, res, url) {
+  const spec = parseQuerySpec(url.searchParams);
+  if (spec.errors.length) return json(res, { error: spec.errors.join("; ") }, 400);
+  const result = mysqlLogIndexAvailable() ? await runQueryFromMysql(spec) : runQueryFromMemory(spec);
+  if (spec.format === "csv") {
+    const header = [...spec.fields, ...(spec.includeRaw ? ["raw"] : [])];
+    const csvRows = [header, ...result.rows.map((row) => header.map((field) => (
+      field === "raw" ? JSON.stringify(row.raw || {}) : row[field]
+    )))];
+    return text(res, csv(csvRows), "text/csv; charset=utf-8", 200, {
+      "Content-Disposition": 'attachment; filename="vpn-log-query.csv"'
+    });
+  }
+  return json(res, result);
+}
+
 async function filterRecordsFromMysql(params) {
   const sourceHash = currentSourceHash();
   const limit = Math.min(Number(params.get("limit") || 1000), 10000);
@@ -2686,9 +2986,14 @@ async function handler(req, res) {
       clearSession(req, res);
       return redirect(res, "/");
     }
-    if (samlSettings.requireAuth && !currentUser(req).authenticated && url.pathname !== "/" && url.pathname !== "/api/auth") return json(res, { error: "Authentication required" }, 401);
+    const staticAsset = STATIC_ASSETS.get(url.pathname);
+    if (samlSettings.requireAuth && !currentUser(req).authenticated && url.pathname !== "/" && url.pathname !== "/api/auth" && !staticAsset) return json(res, { error: "Authentication required" }, 401);
     if (url.pathname === "/") return html(res);
     if (url.pathname === "/admin") return adminHtml(res);
+    if (staticAsset) {
+      res.writeHead(200, { "Content-Type": staticAsset.type, "Cache-Control": "no-store" });
+      return res.end(staticAsset.content);
+    }
     if (url.pathname === "/api/auth") return json(res, { user: currentUser(req), saml: { enabled: samlConfig(req).enabled, ready: samlReady(req), requireAuth: samlConfig(req).requireAuth } });
     if (url.pathname === "/api/health") return json(res, await healthSummary());
     if (url.pathname === "/api/settings/saml" && req.method === "GET") return json(res, publicSamlSettings(req));
@@ -2733,6 +3038,7 @@ async function handler(req, res) {
         rows: result.rows.map(({ searchText, raw, ...record }) => record)
       });
     }
+    if (url.pathname === "/api/query") return handleQuery(req, res, url);
     if (url.pathname === "/api/record") {
       const id = url.searchParams.get("id");
       const record = mysqlLogIndexAvailable() ? await recordFromMysql(id) : store.records.find((item) => item.id === id);
@@ -2764,6 +3070,22 @@ async function handler(req, res) {
 const ADMIN_HTML = fsSync.readFileSync(path.join(__dirname, "public", "admin.html"), "utf8");
 
 const INDEX_HTML = fsSync.readFileSync(path.join(__dirname, "public", "index.html"), "utf8");
+
+const STATIC_ASSET_FILES = [
+  ["/css/app.css", "text/css; charset=utf-8"],
+  ["/js/app.js", "text/javascript; charset=utf-8"],
+  ["/js/api.js", "text/javascript; charset=utf-8"],
+  ["/js/util.js", "text/javascript; charset=utf-8"],
+  ["/js/state.js", "text/javascript; charset=utf-8"],
+  ["/js/router.js", "text/javascript; charset=utf-8"],
+  ["/js/views/dashboard.js", "text/javascript; charset=utf-8"],
+  ["/js/views/investigate.js", "text/javascript; charset=utf-8"],
+  ["/js/views/settings.js", "text/javascript; charset=utf-8"]
+];
+const STATIC_ASSETS = new Map(STATIC_ASSET_FILES.map(([pathname, type]) => [
+  pathname,
+  { content: fsSync.readFileSync(path.join(__dirname, "public", ...pathname.split("/").filter(Boolean)), "utf8"), type }
+]));
 
 if (process.argv.includes("--ingest")) {
   runIngestOnce().catch((error) => {
