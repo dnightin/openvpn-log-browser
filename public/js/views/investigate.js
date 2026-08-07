@@ -4,14 +4,19 @@ import {
 } from "../state.js";
 import { esc, formatDuration, formatBytes, displayTime, debounce } from "../util.js";
 
-const MULTI_FIELDS = [
-  { key: "category", label: "Category" },
-  { key: "eventName", label: "Event" },
-  { key: "os", label: "OS" },
-  { key: "gateway", label: "Gateway" },
-  { key: "userName", label: "User" },
-  { key: "publicIp", label: "Public IP" }
-];
+const CATEGORY_FIELD = { key: "category", label: "Category" };
+
+// Maps a table column key to the multi-value filter field shown directly
+// above it in the toolbar, so each column's filter lines up with the column
+// it filters. Columns with no entry here (time, duration, transfer) get a
+// different kind of control (date/number range, or none) instead.
+const COLUMN_MULTI_FIELDS = {
+  user: { key: "userName", label: "User" },
+  event: { key: "eventName", label: "Event" },
+  device: { key: "os", label: "Device (OS)" },
+  ip: { key: "publicIp", label: "IP / Tunnel" },
+  gateway: { key: "gateway", label: "Gateway" }
+};
 
 const COLUMNS = [
   { key: "time", label: "Time", sort: "timestamp" },
@@ -52,18 +57,16 @@ function churnPanel(churn, timeZone) {
   "</div>";
 }
 
-function createMultiField(root, field) {
-  const wrap = document.createElement("div");
-  wrap.className = "filter-field";
-  wrap.innerHTML =
+function createMultiField(container, field) {
+  container.classList.add("filter-field");
+  container.innerHTML =
     '<label for="mv-' + field.key + '">' + esc(field.label) + "</label>" +
     '<input type="text" id="mv-' + field.key + '" list="dl-' + field.key + '" placeholder="Type and press enter" autocomplete="off">' +
     '<datalist id="dl-' + field.key + '"></datalist>' +
     '<div class="chip-row" data-role="chips"></div>';
-  root.appendChild(wrap);
-  const input = wrap.querySelector("input");
-  const datalist = wrap.querySelector("datalist");
-  const chipRow = wrap.querySelector('[data-role="chips"]');
+  const input = container.querySelector("input");
+  const datalist = container.querySelector("datalist");
+  const chipRow = container.querySelector('[data-role="chips"]');
   const values = new Set();
   let onChange = () => {};
 
@@ -136,14 +139,26 @@ export async function mount(root, routeParams) {
       "</header>" +
       '<div class="investigate-layout" id="investigateLayout">' +
         '<div class="investigate-main">' +
-          '<div class="filter-toolbar" id="filterToolbar">' +
+          '<div class="filter-toolbar-top">' +
             '<div class="filter-field wide"><label for="qInput">Search</label><input type="text" id="qInput" placeholder="user, IP, operation, device, trace id" autocomplete="off"></div>' +
-            '<div id="multiFieldsRoot"></div>' +
-            '<div class="filter-field"><label>Date range</label><div class="range-row"><input type="date" id="fStart" aria-label="Start date"><input type="date" id="fEnd" aria-label="End date"></div></div>' +
-            '<div class="filter-field"><label>Duration (seconds)</label><div class="range-row"><input type="number" id="fDurationMin" placeholder="Min"><input type="number" id="fDurationMax" placeholder="Max"></div></div>' +
+            '<div class="filter-field" id="categorySlot"></div>' +
           "</div>" +
+          '<div class="aligned-scroll" id="alignedScroll"><div class="filter-toolbar-aligned" id="filterToolbarAligned">' +
+            COLUMNS.map((col) => {
+              if (col.key === "time") {
+                return '<div class="filter-field aligned-field" data-col="time"><label>Time</label><div class="range-row"><input type="date" id="fStart" aria-label="Start date"><input type="date" id="fEnd" aria-label="End date"></div></div>';
+              }
+              if (col.key === "duration") {
+                return '<div class="filter-field aligned-field" data-col="duration"><label>Duration</label><div class="range-row"><input type="number" id="fDurationMin" placeholder="Min"><input type="number" id="fDurationMax" placeholder="Max"></div></div>';
+              }
+              if (col.key === "transfer") {
+                return '<div class="filter-field aligned-field" data-col="transfer"></div>';
+              }
+              return '<div class="aligned-field" data-col="' + col.key + '" id="mvSlot-' + col.key + '"></div>';
+            }).join("") +
+          "</div></div>" +
           '<div class="status-line" id="statusLine"></div>' +
-          '<div class="table-scroll"><table class="events" id="eventsTable"></table><div class="table-footer" id="tableFooter" hidden><button type="button" class="secondary" id="loadMoreButton">Load more</button></div></div>' +
+          '<div class="table-scroll" id="tableScroll"><table class="events" id="eventsTable"></table><div class="table-footer" id="tableFooter" hidden><button type="button" class="secondary" id="loadMoreButton">Load more</button></div></div>' +
         "</div>" +
       "</div>" +
     "</div>";
@@ -155,13 +170,22 @@ export async function mount(root, routeParams) {
   const durationMaxInput = root.querySelector("#fDurationMax");
   const statusLine = root.querySelector("#statusLine");
   const eventsTable = root.querySelector("#eventsTable");
+  const tableScroll = root.querySelector("#tableScroll");
   const tableFooter = root.querySelector("#tableFooter");
   const loadMoreButton = root.querySelector("#loadMoreButton");
   const layout = root.querySelector("#investigateLayout");
+  const alignedScroll = root.querySelector("#alignedScroll");
 
-  const multiFieldsRoot = root.querySelector("#multiFieldsRoot");
-  const multiFields = MULTI_FIELDS.map((field) => createMultiField(multiFieldsRoot, field));
+  const categoryFieldControl = createMultiField(root.querySelector("#categorySlot"), CATEGORY_FIELD);
+  const columnFieldControls = Object.entries(COLUMN_MULTI_FIELDS).map(([col, field]) =>
+    createMultiField(root.querySelector("#mvSlot-" + col), field)
+  );
+  const multiFields = [categoryFieldControl, ...columnFieldControls];
   const multiFieldByKey = Object.fromEntries(multiFields.map((field) => [field.key, field]));
+
+  tableScroll.addEventListener("scroll", () => {
+    alignedScroll.scrollLeft = tableScroll.scrollLeft;
+  });
 
   let detailPanel = null;
 
@@ -395,6 +419,13 @@ export async function mount(root, routeParams) {
       const min = minColumnWidths[key] || 80;
       const width = Math.max(min, Number(widths[key] || defaultColumnWidths[key] || min));
       col.style.width = width + "px";
+    });
+    root.querySelectorAll(".aligned-field[data-col]").forEach((cell) => {
+      const key = cell.dataset.col;
+      const min = minColumnWidths[key] || 80;
+      const width = Math.max(min, Number(widths[key] || defaultColumnWidths[key] || min));
+      cell.style.width = width + "px";
+      cell.style.flex = "0 0 " + width + "px";
     });
   }
 

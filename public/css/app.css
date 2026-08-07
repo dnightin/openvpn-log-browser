@@ -85,10 +85,25 @@ label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; font-weig
 
 .investigate-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; flex: 1 1 auto; min-height: 0; }
 .investigate-layout.detail-open { grid-template-columns: minmax(0, 1fr) 340px; }
-.filter-toolbar { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 10px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; align-items: start; flex: 0 0 auto; }
-#multiFieldsRoot { display: contents; }
+
+/* Search + Category: filters with no single matching table column. */
+.filter-toolbar-top { display: flex; gap: 10px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; flex: 0 0 auto; }
+.filter-toolbar-top .filter-field.wide { flex: 1 1 auto; min-width: 0; }
+.filter-toolbar-top .filter-field:not(.wide) { flex: 0 0 220px; }
+
+/*
+ * The aligned row mirrors the event table's columns pixel-for-pixel: same
+ * widths (kept in sync by applyColumnWidths), zero gap between cells (the
+ * table has none either), and its horizontal scroll is slaved to the
+ * table's scroll (see the "scroll" listener in mount()) so a filter always
+ * sits directly above the column it filters, even when scrolled.
+ */
+.aligned-scroll { overflow: hidden; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 8px; background: #f1f5f9; }
+.filter-toolbar-aligned { display: flex; width: max-content; }
+.aligned-field { flex: 0 0 auto; padding: 6px 9px; box-sizing: border-box; min-width: 0; }
+.aligned-field label { display: block; color: var(--muted); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em; margin-bottom: 3px; }
+
 .filter-field { display: grid; gap: 4px; min-width: 0; }
-.filter-field.wide { grid-column: span 2; }
 .filter-field label { color: var(--text); font-size: 12.5px; font-weight: 650; }
 .chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip { display: inline-flex; align-items: center; gap: 5px; min-height: 22px; padding: 2px 4px 2px 9px; border-radius: 999px; background: var(--chip); color: #28505a; font-size: 11.5px; font-weight: 650; }
@@ -171,5 +186,7 @@ pre.raw-json { margin: 0; padding: 12px; background: #0f172a; color: #dbeafe; bo
   .shell-main { order: 1; padding-bottom: 54px; }
   .dashboard-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings-grid { grid-template-columns: 1fr; }
+  .filter-toolbar-top { flex-wrap: wrap; }
+  .filter-toolbar-top .filter-field:not(.wide) { flex: 1 1 160px; }
   .view { padding: 14px; }
 }
