@@ -143,7 +143,7 @@ export async function mount(root, routeParams) {
           '<div id="multiFieldsRoot"></div>' +
           '<div class="filter-field"><label>Date range</label><div class="range-row"><input type="text" id="fStart" placeholder="Start (2026-05-01)"><input type="text" id="fEnd" placeholder="End"></div></div>' +
           '<div class="filter-field"><label>Duration (seconds)</label><div class="range-row"><input type="number" id="fDurationMin" placeholder="Min"><input type="number" id="fDurationMax" placeholder="Max"></div></div>' +
-          '<div class="filter-field"><h3>Saved views</h3><div class="saved-view-row"><input type="text" id="savedViewName" placeholder="View name"><button type="button" class="secondary" id="saveViewButton">Save</button></div><div class="saved-views-list" id="savedViewsList"></div></div>' +
+          '<div class="filter-field"><h3>Saved views</h3><div class="saved-view-add"><input type="text" id="savedViewName" placeholder="View name"><button type="button" class="secondary" id="saveViewButton">Save</button></div><div class="saved-views-list" id="savedViewsList"></div></div>' +
         "</aside>" +
         '<div class="investigate-main">' +
           '<div class="status-line" id="statusLine"></div>' +
