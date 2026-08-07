@@ -1,6 +1,5 @@
 const TIME_ZONE_STORAGE_KEY = "openvpnLogBrowserTimeZone";
 const COLUMN_WIDTH_STORAGE_KEY = "openvpnLogBrowserColumnWidths";
-const SAVED_VIEWS_STORAGE_KEY = "openvpnLogBrowserSavedViews";
 
 export const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
@@ -34,19 +33,6 @@ export function loadColumnWidths() {
 
 export function saveColumnWidths(widths) {
   localStorage.setItem(COLUMN_WIDTH_STORAGE_KEY, JSON.stringify(widths));
-}
-
-export function loadSavedViews() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(SAVED_VIEWS_STORAGE_KEY) || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-export function saveSavedViews(views) {
-  localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(views));
 }
 
 let authState = { authenticated: false, name: "", email: "", source: "none" };

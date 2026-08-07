@@ -1,7 +1,6 @@
 import { api } from "../api.js";
 import {
-  getTimeZone, loadColumnWidths, saveColumnWidths, defaultColumnWidths, minColumnWidths,
-  loadSavedViews, saveSavedViews
+  getTimeZone, loadColumnWidths, saveColumnWidths, defaultColumnWidths, minColumnWidths
 } from "../state.js";
 import { esc, formatDuration, formatBytes, displayTime, debounce } from "../util.js";
 
@@ -143,7 +142,6 @@ export async function mount(root, routeParams) {
           '<div id="multiFieldsRoot"></div>' +
           '<div class="filter-field"><label>Date range</label><div class="range-row"><input type="date" id="fStart" aria-label="Start date"><input type="date" id="fEnd" aria-label="End date"></div></div>' +
           '<div class="filter-field"><label>Duration (seconds)</label><div class="range-row"><input type="number" id="fDurationMin" placeholder="Min"><input type="number" id="fDurationMax" placeholder="Max"></div></div>' +
-          '<div class="filter-field"><h3>Saved views</h3><div class="saved-view-add"><input type="text" id="savedViewName" placeholder="View name"><button type="button" class="secondary" id="saveViewButton">Save</button></div><div class="saved-views-list" id="savedViewsList"></div></div>' +
         "</aside>" +
         '<div class="investigate-main">' +
           '<div class="status-line" id="statusLine"></div>' +
@@ -164,8 +162,6 @@ export async function mount(root, routeParams) {
   const layout = root.querySelector("#investigateLayout");
   const filterSidebar = root.querySelector("#filterSidebar");
   const filterBackdrop = root.querySelector("#filterBackdrop");
-  const savedViewsList = root.querySelector("#savedViewsList");
-  const savedViewNameInput = root.querySelector("#savedViewName");
 
   const multiFieldsRoot = root.querySelector("#multiFieldsRoot");
   const multiFields = MULTI_FIELDS.map((field) => createMultiField(multiFieldsRoot, field));
@@ -447,52 +443,6 @@ export async function mount(root, routeParams) {
     });
   }
 
-  function renderSavedViews() {
-    const views = loadSavedViews();
-    savedViewsList.innerHTML = views.map((view, index) =>
-      '<div class="saved-view-row"><button type="button" class="ghost" data-apply="' + index + '">' + esc(view.name) +
-      '</button><button type="button" class="remove" data-remove="' + index + '" aria-label="Remove ' + esc(view.name) + '">&times;</button></div>'
-    ).join("") || '<div class="muted">No saved views yet.</div>';
-  }
-
-  savedViewsList.addEventListener("click", (event) => {
-    const applyButton = event.target.closest("[data-apply]");
-    const removeButton = event.target.closest("[data-remove]");
-    const views = loadSavedViews();
-    if (applyButton) {
-      const view = views[Number(applyButton.dataset.apply)];
-      if (!view) return;
-      state.q = view.q || ""; qInput.value = state.q;
-      state.start = view.start || ""; startInput.value = state.start;
-      state.end = view.end || ""; endInput.value = state.end;
-      state.durationMin = view.durationMin || ""; durationMinInput.value = state.durationMin;
-      state.durationMax = view.durationMax || ""; durationMaxInput.value = state.durationMax;
-      multiFields.forEach((field) => field.setValues((view.multi || {})[field.key] || []));
-      onFilterChanged();
-    } else if (removeButton) {
-      views.splice(Number(removeButton.dataset.remove), 1);
-      saveSavedViews(views);
-      renderSavedViews();
-    }
-  });
-
-  root.querySelector("#saveViewButton").addEventListener("click", () => {
-    const name = savedViewNameInput.value.trim();
-    if (!name) return;
-    const views = loadSavedViews();
-    views.push({
-      name,
-      q: state.q,
-      start: startInput.value.trim(),
-      end: endInput.value.trim(),
-      durationMin: durationMinInput.value.trim(),
-      durationMax: durationMaxInput.value.trim(),
-      multi: Object.fromEntries(multiFields.map((field) => [field.key, [...field.values]]))
-    });
-    saveSavedViews(views);
-    savedViewNameInput.value = "";
-    renderSavedViews();
-  });
 
   async function loadFacets() {
     const data = await api.getFacets();
@@ -505,7 +455,6 @@ export async function mount(root, routeParams) {
   }
 
   setupResizableColumns();
-  renderSavedViews();
   await Promise.all([loadFacets().catch(console.error), search()]);
 
   return () => {
