@@ -1,6 +1,7 @@
 const http = require("node:http");
 const https = require("node:https");
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
 const crypto = require("node:crypto");
@@ -25,6 +26,13 @@ const LOG_INDEX_RETENTION_DAYS = Math.max(0, Number(process.env.LOG_INDEX_RETENT
 const SLOW_API_MS = Math.max(0, Number(process.env.SLOW_API_MS || 500));
 const SLOW_DB_MS = Math.max(0, Number(process.env.SLOW_DB_MS || 500));
 const SESSION_COOKIE = "openvpn_log_browser_session";
+const SESSION_IDLE_TIMEOUT_MS = Math.max(1, Number(process.env.SESSION_IDLE_TIMEOUT_MINUTES || 720)) * 60 * 1000;
+const TRUST_PROXY = toBool(process.env.TRUST_PROXY);
+const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+const ADMIN_SETUP_TOKEN = process.env.ADMIN_SETUP_TOKEN || "";
 const MYSQL_ENABLED = Boolean(process.env.MYSQL_HOST || process.env.MYSQL_USER || process.env.MYSQL_DATABASE);
 const MYSQL_CONFIG = {
   host: process.env.MYSQL_HOST || "127.0.0.1",
@@ -34,7 +42,7 @@ const MYSQL_CONFIG = {
   database: process.env.MYSQL_DATABASE || "openvpn_log_browser"
 };
 const WEB_INGEST_ENABLED = process.env.WEB_INGEST_ENABLED ? toBool(process.env.WEB_INGEST_ENABLED) : !MYSQL_ENABLED;
-const SECRET_KEY_RE = /(token|secret|password|credential|private.?key|client.?key|refresh|bearer|session)/i;
+const SECRET_KEY_RE = /(token|secret|password|passwd|credential|privatekey|clientkey|apikey|authorization|cookie|bearer)/i;
 
 let store = {
   records: [],
@@ -202,9 +210,20 @@ function samlConfig(req) {
   };
 }
 
+function requestProtocol(req) {
+  if (TRUST_PROXY) {
+    const forwarded = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+    if (forwarded) return forwarded;
+  }
+  return req.socket && req.socket.encrypted ? "https" : "http";
+}
+
+function isSecureRequest(req) {
+  return requestProtocol(req) === "https";
+}
+
 function requestOrigin(req) {
-  const proto = req.headers["x-forwarded-proto"] || "http";
-  return `${proto}://${req.headers.host || `localhost:${PORT}`}`;
+  return `${requestProtocol(req)}://${req.headers.host || `localhost:${PORT}`}`;
 }
 
 function samlReady(req) {
@@ -232,11 +251,22 @@ function currentUser(req) {
   const sessionId = cookies[SESSION_COOKIE];
   const session = sessionId ? sessions.get(sessionId) : null;
   if (!session) return { authenticated: false, name: "", email: "", source: "none" };
+  if (Date.now() - session.lastSeen > SESSION_IDLE_TIMEOUT_MS) {
+    sessions.delete(sessionId);
+    return { authenticated: false, name: "", email: "", source: "none" };
+  }
   session.lastSeen = Date.now();
   return { authenticated: true, ...session.user };
 }
 
-function createSession(res, profile = {}) {
+function sweepExpiredSessions() {
+  const now = Date.now();
+  for (const [sessionId, session] of sessions) {
+    if (now - session.lastSeen > SESSION_IDLE_TIMEOUT_MS) sessions.delete(sessionId);
+  }
+}
+
+function createSession(req, res, profile = {}) {
   const sessionId = crypto.randomBytes(32).toString("base64url");
   const user = {
     name: profile.displayName || profile.name || profile.cn || profile.email || profile.nameID || "SAML user",
@@ -244,14 +274,55 @@ function createSession(res, profile = {}) {
     source: "saml"
   };
   sessions.set(sessionId, { user, createdAt: Date.now(), lastSeen: Date.now() });
-  setCookie(res, SESSION_COOKIE, sessionId, { httpOnly: true, sameSite: "Lax", path: "/" });
+  setCookie(res, SESSION_COOKIE, sessionId, { httpOnly: true, sameSite: "Lax", path: "/", secure: isSecureRequest(req) });
   return user;
 }
 
 function clearSession(req, res) {
   const cookies = parseCookies(req.headers.cookie || "");
   if (cookies[SESSION_COOKIE]) sessions.delete(cookies[SESSION_COOKIE]);
-  setCookie(res, SESSION_COOKIE, "", { maxAge: 0, httpOnly: true, sameSite: "Lax", path: "/" });
+  setCookie(res, SESSION_COOKIE, "", { maxAge: 0, httpOnly: true, sameSite: "Lax", path: "/", secure: isSecureRequest(req) });
+}
+
+function adminConfigured() {
+  return Boolean(ADMIN_SETUP_TOKEN || ADMIN_EMAILS.length);
+}
+
+function bearerToken(req) {
+  const header = req.headers.authorization || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
+}
+
+function timingSafeEqualString(a, b) {
+  const bufA = Buffer.from(String(a || ""));
+  const bufB = Buffer.from(String(b || ""));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function isAdminRequest(req) {
+  if (ADMIN_SETUP_TOKEN) {
+    const provided = req.headers["x-admin-token"] || bearerToken(req);
+    if (provided && timingSafeEqualString(provided, ADMIN_SETUP_TOKEN)) return true;
+  }
+  if (ADMIN_EMAILS.length) {
+    const user = currentUser(req);
+    if (user.authenticated && user.email && ADMIN_EMAILS.includes(user.email.toLowerCase())) return true;
+  }
+  return false;
+}
+
+function requireAdmin(req, res) {
+  if (!adminConfigured()) {
+    json(res, { error: "Admin access is not configured. Set ADMIN_SETUP_TOKEN or ADMIN_EMAILS to allow settings changes." }, 403);
+    return false;
+  }
+  if (!isAdminRequest(req)) {
+    json(res, { error: "Admin access required." }, 403);
+    return false;
+  }
+  return true;
 }
 
 function parseCookies(header) {
@@ -266,6 +337,7 @@ function setCookie(res, name, value, options = {}) {
   if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
   if (options.httpOnly) parts.push("HttpOnly");
   if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  if (options.secure) parts.push("Secure");
   if (options.path) parts.push(`Path=${options.path}`);
   res.setHeader("Set-Cookie", parts.join("; "));
 }
@@ -303,7 +375,7 @@ async function samlCallback(req, res) {
   if (!samlReady(req)) return json(res, { error: "SAML is not configured." }, 400);
   const body = querystring.parse(await readRequestBody(req));
   const result = await getSaml(req).validatePostResponseAsync(body);
-  createSession(res, result.profile || result);
+  createSession(req, res, result.profile || result);
   redirect(res, String(body.RelayState || "/"));
 }
 
@@ -331,13 +403,17 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function httpGetBufferOnce(url) {
+function httpGetBufferOnce(url, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https:") ? https : http;
     const req = client.get(url, { timeout: 30000 }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        resolve(httpGetBuffer(new URL(res.headers.location, url).toString()));
+        if (redirectsLeft <= 0) {
+          reject(new Error(`GET ${url} exceeded maximum redirects`));
+          return;
+        }
+        resolve(httpGetBufferOnce(new URL(res.headers.location, url).toString(), redirectsLeft - 1));
         return;
       }
       const chunks = [];
@@ -587,10 +663,6 @@ function normalizeRecord(raw, sourceKey, lineNumber) {
   };
 }
 
-async function parseObject(compressed, key) {
-  return parseJsonlGz(compressed, key);
-}
-
 async function loadFromS3() {
   const config = sourceConfig();
   const apiMode = config.mode === "s3-api";
@@ -651,7 +723,7 @@ async function loadFromS3() {
           await writeCachedS3Object(manifest, object, compressed);
           downloaded += 1;
         }
-        const parsed = await parseObject(compressed, object.key);
+        const parsed = await parseJsonlGz(compressed, object.key);
         objectRecordCache.set(object.key, { fingerprint: object.fingerprint, records: parsed });
         return { object, records: parsed, indexable: true };
       } catch (error) {
@@ -792,7 +864,7 @@ async function loadFromRawDir() {
   for (const file of gzFiles) {
     const compressed = await fs.readFile(file);
     const key = path.relative(RAW_DIR, file).replaceAll(path.sep, "/");
-    records.push(...await parseObject(compressed, key));
+    records.push(...await parseJsonlGz(compressed, key));
   }
   return {
     records,
@@ -1088,10 +1160,6 @@ async function mysqlIndexedObjects(sourceHash) {
     [sourceHash]
   );
   return new Map(rows.map((row) => [row.object_key, row.fingerprint]));
-}
-
-async function saveParsedObjectToMysql(sourceId, sourceHash, object, records) {
-  return saveParsedObjectsToMysql(sourceId, sourceHash, [{ object, records }]);
 }
 
 async function saveParsedObjectsToMysql(sourceId, sourceHash, parsedObjects) {
@@ -1822,7 +1890,7 @@ async function latestActiveConnectionsFromMysql(atTime = Date.now()) {
   const records = await connectionRecordsFromMysqlSince(staleCutoff);
   const latestByUser = new Map();
   for (const record of records) {
-    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    const userName = recordUserName(record);
     if (!userName) continue;
     const timestamp = Date.parse(record.timestamp);
     if (!Number.isFinite(timestamp) || timestamp > atTime) continue;
@@ -1877,13 +1945,7 @@ async function activeConnectionsSnapshotFromMysql(atTime = Date.now()) {
 
 async function excessiveReconnectUsersFromMysql(newest, cutoff) {
   const records = await connectionRecordsFromMysqlSince(cutoff);
-  const previousRecords = store.records;
-  store.records = records;
-  try {
-    return excessiveReconnectUsers(newest, cutoff);
-  } finally {
-    store.records = previousRecords;
-  }
+  return excessiveReconnectUsers(newest, cutoff, records);
 }
 
 async function churnLeaderboardFromMysql(limit = 10) {
@@ -1915,13 +1977,7 @@ async function buildChurnLeaderboardFromMysql(limit = 10) {
   const newest = row.newest ? Date.parse(row.newest) : Date.now();
   const cutoff = newest - (24 * 60 * 60 * 1000);
   const records = await connectionRecordsFromMysqlSince(cutoff);
-  const previousRecords = store.records;
-  store.records = records;
-  try {
-    return churnLeaderboard(limit);
-  } finally {
-    store.records = previousRecords;
-  }
+  return churnLeaderboard(limit, records);
 }
 
 async function updateMysqlChurnCache(sourceHash, generatedAt) {
@@ -1953,13 +2009,7 @@ async function userChurnSummaryFromMysql(userName) {
      ORDER BY timestamp_dt DESC, id_hash DESC`,
     [currentSourceHash(), mysqlDate(new Date(cutoff)), userName, userName, userName]
   );
-  const previousRecords = store.records;
-  store.records = rows.map(mysqlRowToRecord);
-  try {
-    return userChurnSummary(userName);
-  } finally {
-    store.records = previousRecords;
-  }
+  return userChurnSummary(userName, rows.map(mysqlRowToRecord));
 }
 
 async function refresh() {
@@ -2034,7 +2084,7 @@ function facets() {
   };
 }
 
-function userChurnSummary(userName) {
+function userChurnSummary(userName, records = store.records) {
   if (!userName) {
     return {
       userName: "",
@@ -2051,10 +2101,10 @@ function userChurnSummary(userName) {
   }
 
   const windowHours = 24;
-  const newest = newestRecordTimestamp();
+  const newest = newestRecordTimestamp(records);
   const cutoff = newest - (windowHours * 60 * 60 * 1000);
-  const userRecords = store.records.filter((record) => {
-    if ((record.userName || record.parentEntityName || record.initiatorName) !== userName) return false;
+  const userRecords = records.filter((record) => {
+    if (recordUserName(record) !== userName) return false;
     const ts = Date.parse(record.timestamp);
     return Number.isFinite(ts) && ts >= cutoff;
   });
@@ -2063,7 +2113,7 @@ function userChurnSummary(userName) {
   const disconnected = userRecords.filter((record) => record.eventName === "client-disconnected").length;
   const shortSessions = userRecords.filter((record) => record.eventName === "client-disconnected" && record.durationSeconds > 0 && record.durationSeconds <= 60).length;
   const totalTransfer = userRecords.reduce((sum, record) => sum + (record.bytesIn || 0) + (record.bytesOut || 0), 0);
-  const connectedForSeconds = connectedSecondsByUser(newest, cutoff).get(userName) || 0;
+  const connectedForSeconds = connectedSecondsByUser(newest, cutoff, records).get(userName) || 0;
   const total = connected + disconnected;
   let severity = "normal";
   if (total >= 100 || shortSessions >= 25) severity = "high";
@@ -2098,18 +2148,18 @@ function userChurnSummary(userName) {
   };
 }
 
-function churnLeaderboard(limit = 10) {
+function churnLeaderboard(limit = 10, records = store.records) {
   const windowHours = 24;
-  const newest = newestRecordTimestamp();
+  const newest = newestRecordTimestamp(records);
   const cutoff = newest - (windowHours * 60 * 60 * 1000);
   const users = new Map();
-  const connectedSeconds = connectedSecondsByUser(newest, cutoff);
+  const connectedSeconds = connectedSecondsByUser(newest, cutoff, records);
 
-  for (const record of store.records) {
+  for (const record of records) {
     if (record.eventName !== "client-connected" && record.eventName !== "client-disconnected") continue;
     const ts = Date.parse(record.timestamp);
     if (!Number.isFinite(ts) || ts < cutoff) continue;
-    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    const userName = recordUserName(record);
     if (!userName) continue;
     if (!users.has(userName)) {
       users.set(userName, {
@@ -2157,13 +2207,13 @@ function churnLeaderboard(limit = 10) {
   };
 }
 
-function excessiveReconnectUsers(newest, cutoff) {
+function excessiveReconnectUsers(newest, cutoff, records = store.records) {
   const users = new Map();
-  for (const record of store.records) {
+  for (const record of records) {
     if (record.eventName !== "client-connected" && record.eventName !== "client-disconnected") continue;
     const ts = Date.parse(record.timestamp);
     if (!Number.isFinite(ts) || ts < cutoff) continue;
-    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    const userName = recordUserName(record);
     if (!userName) continue;
     if (!users.has(userName)) users.set(userName, { total: 0, shortSessions: 0 });
     const user = users.get(userName);
@@ -2176,20 +2226,20 @@ function excessiveReconnectUsers(newest, cutoff) {
     .map(([userName]) => userName));
 }
 
-function connectionSessions() {
+function connectionSessions(records = store.records) {
   const sessions = new Map();
-  for (const record of store.records) {
+  for (const record of records) {
     if (!record.sessionId || (record.eventName !== "client-connected" && record.eventName !== "client-disconnected")) continue;
     if (!sessions.has(record.sessionId)) {
       sessions.set(record.sessionId, {
-        userName: record.userName || record.parentEntityName || record.initiatorName,
+        userName: recordUserName(record),
         start: Number.POSITIVE_INFINITY,
         end: null,
         latestTimestamp: ""
       });
     }
     const session = sessions.get(record.sessionId);
-    if (!session.userName) session.userName = record.userName || record.parentEntityName || record.initiatorName;
+    if (!session.userName) session.userName = recordUserName(record);
     const start = Date.parse(record.sessionStartTime || record.timestamp);
     if (Number.isFinite(start)) session.start = Math.min(session.start, start);
     if (record.eventName === "client-disconnected") {
@@ -2201,9 +2251,9 @@ function connectionSessions() {
   return [...sessions.values()].filter((session) => session.userName && Number.isFinite(session.start));
 }
 
-function connectedSecondsByUser(newest, cutoff) {
+function connectedSecondsByUser(newest, cutoff, records = store.records) {
   const byUser = new Map();
-  for (const session of connectionSessions()) {
+  for (const session of connectionSessions(records)) {
     const end = session.end || newest;
     const overlapStart = Math.max(session.start, cutoff);
     const overlapEnd = Math.min(end, newest);
@@ -2213,9 +2263,9 @@ function connectedSecondsByUser(newest, cutoff) {
   return byUser;
 }
 
-function newestRecordTimestamp() {
+function newestRecordTimestamp(records = store.records) {
   let newest = 0;
-  for (const record of store.records) {
+  for (const record of records) {
     const ts = Date.parse(record.timestamp);
     if (Number.isFinite(ts) && ts > newest) newest = ts;
   }
@@ -2240,7 +2290,7 @@ function latestActiveConnections(atTime = newestRecordTimestamp()) {
   const latestByUser = new Map();
   for (const record of store.records) {
     if (record.eventName !== "client-connected" && record.eventName !== "client-disconnected") continue;
-    const userName = record.userName || record.parentEntityName || record.initiatorName;
+    const userName = recordUserName(record);
     if (!userName) continue;
     const timestamp = Date.parse(record.timestamp);
     if (!Number.isFinite(timestamp) || timestamp > atTime) continue;
@@ -2513,8 +2563,16 @@ function unique(values) {
   return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
 
+function recordUserName(record) {
+  return record.userName || record.parentEntityName || record.initiatorName;
+}
+
+function normalizeKeyForSecretCheck(key) {
+  return String(key || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
 function redact(value, key = "") {
-  if (SECRET_KEY_RE.test(key)) return "[redacted]";
+  if (SECRET_KEY_RE.test(normalizeKeyForSecretCheck(key))) return "[redacted]";
   if (Array.isArray(value)) return value.map((item) => redact(item));
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, redact(childValue, childKey)]));
@@ -2635,6 +2693,7 @@ async function handler(req, res) {
     if (url.pathname === "/api/health") return json(res, await healthSummary());
     if (url.pathname === "/api/settings/saml" && req.method === "GET") return json(res, publicSamlSettings(req));
     if (url.pathname === "/api/settings/saml" && req.method === "POST") {
+      if (!requireAdmin(req, res)) return;
       const nextSettings = cleanSamlSettings(await readJsonBody(req));
       if (nextSettings.requireAuth && (!nextSettings.enabled || !nextSettings.entryPoint || !nextSettings.idpCert || !nextSettings.issuer)) {
         return json(res, { error: "Require SSO can only be enabled after SAML login URL, entity ID, and IdP certificate are configured." }, 400);
@@ -2644,6 +2703,7 @@ async function handler(req, res) {
     }
     if (url.pathname === "/api/settings/source" && req.method === "GET") return json(res, publicSourceSettings());
     if (url.pathname === "/api/settings/source" && req.method === "POST") {
+      if (!requireAdmin(req, res)) return;
       const nextSettings = cleanSourceSettings(await readJsonBody(req));
       if (nextSettings.mode === "http" && !nextSettings.bucketUrl) return json(res, { error: "S3 bucket URL is required for HTTP mode." }, 400);
       if (nextSettings.mode === "s3-api" && !nextSettings.bucketName) return json(res, { error: "S3 bucket name is required for S3 API mode." }, 400);
@@ -2678,7 +2738,7 @@ async function handler(req, res) {
       const record = mysqlLogIndexAvailable() ? await recordFromMysql(id) : store.records.find((item) => item.id === id);
       if (!record) return notFound(res);
       const raw = record.raw && Object.keys(record.raw).length ? record.raw : await loadRecordRawFromMysql(currentSourceHash(), id) || {};
-      const userName = record.userName || record.parentEntityName || record.initiatorName;
+      const userName = recordUserName(record);
       const churn = mysqlLogIndexAvailable() ? await userChurnSummaryFromMysql(userName) : userChurnSummary(userName);
       return json(res, { ...record, searchText: undefined, raw: redact(raw), churn });
     }
@@ -2701,1036 +2761,9 @@ async function handler(req, res) {
   }
 }
 
-const ADMIN_HTML = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenVPN Log Search Admin</title>
-  <style>
-    :root { color-scheme: light; --bg:#f7f8fb; --panel:#fff; --text:#18202b; --muted:#667085; --line:#d9dee8; --accent:#166c7d; --danger:#9f2936; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); }
-    header { min-height: 58px; padding: 12px 20px; background: #101827; color: white; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-    h1, h2 { margin: 0; letter-spacing: 0; }
-    h1 { font-size: 18px; }
-    h2 { font-size: 15px; }
-    a { color: inherit; }
-    main { padding: 16px; display: grid; gap: 12px; }
-    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
-    .wide { grid-column: span 2; }
-    .full { grid-column: 1 / -1; }
-    .stat { display: grid; gap: 4px; }
-    .stat strong { font-size: 22px; }
-    .muted, .label { color: var(--muted); font-size: 12px; }
-    .ok { color: #166534; }
-    .bad { color: var(--danger); }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-    th { color: var(--muted); font-size: 12px; font-weight: 700; }
-    code { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
-    .button { height: 34px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--accent); background: var(--accent); color: white; display: inline-flex; align-items: center; text-decoration: none; font-weight: 700; }
-    .button.secondary { background: white; color: var(--accent); }
-    @media (max-width: 1000px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .wide { grid-column: 1 / -1; } }
-    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
-  </style>
-</head>
-<body>
-  <header>
-    <div>
-      <h1>OpenVPN Log Search Admin</h1>
-      <div class="muted" id="generated">Loading health...</div>
-    </div>
-    <div class="actions">
-      <a class="button secondary" href="/">Events</a>
-      <a class="button" href="/api/connected-users/export?range=year">Export Licensing CSV</a>
-    </div>
-  </header>
-  <main>
-    <section class="grid">
-      <div class="panel stat"><span class="label">Status</span><strong id="status">-</strong></div>
-      <div class="panel stat"><span class="label">Records</span><strong id="records">-</strong></div>
-      <div class="panel stat"><span class="label">Active Users</span><strong id="active">-</strong></div>
-      <div class="panel stat"><span class="label">Memory RSS</span><strong id="rss">-</strong></div>
-      <div class="panel wide"><h2>Runtime</h2><div id="runtime"></div></div>
-      <div class="panel wide"><h2>Configuration</h2><div id="config"></div></div>
-      <div class="panel wide"><h2>Cache Ages</h2><table><thead><tr><th>Cache</th><th>Generated</th><th>Age</th></tr></thead><tbody id="caches"></tbody></table></div>
-      <div class="panel wide"><h2>MariaDB Tables</h2><table><thead><tr><th>Table</th><th>Rows</th><th>Data</th><th>Index</th></tr></thead><tbody id="tables"></tbody></table></div>
-      <div class="panel full"><h2>Indexes</h2><div id="indexes"></div></div>
-      <div class="panel full"><h2>Recent Slow Calls</h2><table><thead><tr><th>Time</th><th>Kind</th><th>Label</th><th>ms</th></tr></thead><tbody id="slow"></tbody></table></div>
-    </section>
-  </main>
-  <script>
-    const fmt = new Intl.NumberFormat();
-    const bytes = value => {
-      value = Number(value || 0);
-      const units = ["B","KB","MB","GB","TB"];
-      let unit = 0;
-      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-      return (value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)) + " " + units[unit];
-    };
-    const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
-    const row = items => "<tr>" + items.map(item => "<td>" + item + "</td>").join("") + "</tr>";
-    const kv = obj => Object.entries(obj || {}).map(([key, value]) => "<div><span class='label'>" + esc(key) + "</span><br><code>" + esc(value) + "</code></div>").join("<br>");
-    const age = value => {
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return "-";
-      const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
-      if (seconds < 60) return seconds + "s";
-      if (seconds < 3600) return Math.round(seconds / 60) + "m";
-      return Math.round(seconds / 3600) + "h";
-    };
-    async function load() {
-      const res = await fetch("/api/health");
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || res.statusText);
-      document.querySelector("#generated").textContent = "Generated " + new Date(data.generatedAt).toLocaleString();
-      document.querySelector("#status").textContent = data.status;
-      document.querySelector("#status").className = data.status === "ok" ? "ok" : "bad";
-      document.querySelector("#records").textContent = fmt.format(data.app.records);
-      document.querySelector("#active").textContent = fmt.format(data.app.activeUsers) + " / " + fmt.format(data.app.activeSessions);
-      document.querySelector("#rss").textContent = bytes(data.process.rssBytes);
-      document.querySelector("#runtime").innerHTML = kv({ pid: data.process.pid, uptimeSeconds: data.process.uptimeSeconds, node: data.process.node, mysql: data.mysql.status, loadedAt: data.app.loadedAt || "", source: data.app.source || "" });
-      document.querySelector("#config").innerHTML = kv(data.config);
-      document.querySelector("#caches").innerHTML = (data.mysql.caches || []).map(item => row([esc(item.name), esc(item.generatedAt || "-"), esc(age(item.generatedAt))])).join("");
-      document.querySelector("#tables").innerHTML = (data.mysql.tables || []).map(item => row([esc(item.name), fmt.format(item.estimatedRows), bytes(item.dataBytes), bytes(item.indexBytes)])).join("");
-      document.querySelector("#indexes").innerHTML = (data.mysql.indexes || []).map(item => "<code>" + esc(item) + "</code>").join(" ");
-      document.querySelector("#slow").innerHTML = (data.slowEvents || []).map(item => row([esc(new Date(item.timestamp).toLocaleString()), esc(item.kind), esc(item.label), fmt.format(item.elapsedMs)])).join("") || row(["-", "No slow calls recorded in this process", "-", "-"]);
-    }
-    load().catch(error => { document.querySelector("#status").textContent = error.message; document.querySelector("#status").className = "bad"; });
-  </script>
-</body>
-</html>`;
+const ADMIN_HTML = fsSync.readFileSync(path.join(__dirname, "public", "admin.html"), "utf8");
 
-const INDEX_HTML = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenVPN Log Search</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f7f8fb;
-      --panel: #ffffff;
-      --text: #18202b;
-      --muted: #667085;
-      --line: #d9dee8;
-      --accent: #166c7d;
-      --accent-2: #8a5b16;
-      --danger: #9f2936;
-      --chip: #eef4f6;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; height: 100dvh; overflow: hidden; }
-    header { background: #111827; color: white; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
-    .brand { min-width: 0; }
-    header h1 { margin: 0; font-size: 20px; font-weight: 720; letter-spacing: 0; }
-    header .sub { margin-top: 3px; color: #cbd5e1; font-size: 12px; }
-    .account { position: relative; flex: 0 0 auto; }
-    .menu-button { background: transparent; border-color: #374151; color: white; display: inline-flex; align-items: center; gap: 8px; }
-    .menu-button:hover { background: #1f2937; }
-    .account-menu { position: absolute; right: 0; top: calc(100% + 8px); width: 220px; background: white; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 14px 28px rgba(15, 23, 42, .18); padding: 6px; display: none; z-index: 5; }
-    .account.open .account-menu { display: grid; gap: 4px; }
-    .account-menu button, .account-menu a { height: 34px; border: 0; background: white; color: var(--text); border-radius: 6px; padding: 0 9px; text-align: left; text-decoration: none; display: flex; align-items: center; font-weight: 650; }
-    .account-menu button:hover, .account-menu a:hover { background: #f1f5f9; }
-    .account-name { padding: 7px 9px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    main { padding: 12px 24px 22px; max-width: 1500px; margin: 0 auto; height: calc(100vh - 57px); height: calc(100dvh - 57px); display: flex; flex-direction: column; min-height: 0; width: 100%; }
-    .dashboard-top { display: grid; grid-template-columns: minmax(160px, 210px) minmax(340px, 1fr) minmax(260px, 320px); gap: 10px; margin-bottom: 10px; align-items: stretch; flex: 0 0 auto; }
-    .stats { display: grid; grid-template-columns: 1fr; gap: 10px; min-width: 0; }
-    .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; min-height: 104px; }
-    .stat strong { display: block; font-size: 19px; line-height: 1.25; }
-    .stat span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .chart-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; min-height: 104px; min-width: 0; overflow: hidden; }
-    .chart-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; margin-bottom: 5px; }
-    .chart-head h2 { margin: 0; font-size: 13px; line-height: 1.25; }
-    .chart-head span { color: var(--muted); font-size: 11px; display: block; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .chart-controls { display: grid; justify-items: end; gap: 3px; min-width: 0; }
-    .chart-controls select { height: 28px; padding: 0 7px; font-size: 12px; }
-    .chart { width: 100%; height: 76px; display: block; }
-    .chart-grid { stroke: #e5e9f0; stroke-width: 1; }
-    .chart-line { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-    .chart-area { fill: rgba(22, 108, 125, .12); }
-    .chart-dot { fill: var(--accent); }
-    .chart-label { fill: var(--muted); font-size: 11px; }
-    .toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(120px, 150px) minmax(130px, 160px) minmax(110px, 130px) minmax(140px, 170px) minmax(110px, 140px) minmax(110px, 140px) 90px 140px; gap: 8px; align-items: end; margin-bottom: 8px; flex: 0 0 auto; }
-    label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; font-weight: 650; }
-    input, select, button { height: 34px; border-radius: 7px; border: 1px solid var(--line); background: white; color: var(--text); padding: 0 10px; font: inherit; min-width: 0; }
-    button { background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 700; }
-    button.secondary { background: white; color: var(--accent); }
-    .toolbar-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-self: end; }
-    .toolbar-actions button { width: 100%; }
-    .status { margin: 4px 0 8px; color: var(--muted); font-size: 12px; min-height: 16px; flex: 0 0 auto; }
-    .status.error { color: var(--danger); }
-    .muted { color: var(--muted); font-size: 12px; }
-    dialog { border: 1px solid var(--line); border-radius: 8px; padding: 0; width: min(760px, calc(100vw - 24px)); max-height: calc(100vh - 40px); box-shadow: 0 24px 80px rgba(15, 23, 42, .24); }
-    dialog::backdrop { background: rgba(15, 23, 42, .4); }
-    .settings { padding: 16px; display: grid; gap: 14px; }
-    .settings header { background: transparent; color: var(--text); padding: 0 0 10px; border-bottom: 1px solid var(--line); }
-    .settings h2, .settings h3 { margin: 0; }
-    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .settings textarea { min-height: 130px; resize: vertical; border-radius: 7px; border: 1px solid var(--line); padding: 9px 10px; font: inherit; }
-    .settings .wide { grid-column: 1 / -1; }
-    .check-row { display: flex; align-items: center; gap: 8px; min-height: 38px; color: var(--text); }
-    .check-row input { height: auto; }
-    .settings-actions { display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
-    .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; align-items: stretch; min-height: 0; flex: 1 1 auto; }
-    .layout.detail-open { grid-template-columns: minmax(0, 1fr) minmax(320px, 380px); }
-    .table-scroll { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); contain: size layout paint; }
-    .table-footer { position: sticky; left: 0; bottom: 0; display: flex; justify-content: center; padding: 10px; border-top: 1px solid var(--line); background: rgba(255,255,255,.94); }
-    .table-footer[hidden] { display: none; }
-    .table-footer button { min-width: 132px; }
-    table { width: max-content; min-width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--panel); }
-    th, td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
-    th { color: var(--muted); background: #f1f5f9; font-size: 12px; position: sticky; top: 0; z-index: 1; user-select: none; }
-    th .th-label { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 9px; }
-    .col-resizer { position: absolute; top: 0; right: -3px; width: 7px; height: 100%; cursor: col-resize; touch-action: none; z-index: 2; }
-    .col-resizer::after { content: ""; position: absolute; top: 8px; bottom: 8px; left: 3px; width: 1px; background: transparent; }
-    th:hover .col-resizer::after, body.resizing-columns .col-resizer::after { background: #aab4c3; }
-    body.resizing-columns { cursor: col-resize; user-select: none; }
-    tr { cursor: pointer; }
-    tr:hover td { background: #f8fbfc; }
-    tr.selected td { background: #eef8fb; }
-    td.time { white-space: nowrap; font-variant-numeric: tabular-nums; }
-    td.ip, td.user, td.op { overflow-wrap: anywhere; }
-    td.wrap { white-space: normal; overflow-wrap: anywhere; }
-    .chip { display: inline-flex; align-items: center; min-height: 23px; padding: 2px 8px; border-radius: 999px; background: var(--chip); color: #28505a; font-size: 12px; font-weight: 650; }
-    aside { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-height: 0; overflow: auto; }
-    .detail-panel[hidden] { display: none; }
-    aside h2 { margin: 0; padding: 13px 14px; font-size: 15px; }
-    .detail-head { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
-    .icon-button { width: 32px; height: 32px; margin-right: 8px; padding: 0; border-radius: 7px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 22px; line-height: 1; display: none; align-items: center; justify-content: center; }
-    .icon-button:hover { border-color: var(--line); background: #f8fafc; color: var(--text); }
-    .details { padding: 12px 14px; }
-    .kv { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 6px 10px; font-size: 13px; margin-bottom: 12px; }
-    .kv div:nth-child(odd) { color: var(--muted); }
-    .churn { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 12px; background: #fbfcfe; }
-    .churn h3 { margin: 0 0 8px; font-size: 13px; }
-    .churn .summary { margin-bottom: 8px; font-size: 13px; color: var(--muted); }
-    .churn.elevated { border-color: #d99a2b; background: #fff8eb; }
-    .churn.high { border-color: var(--danger); background: #fff1f2; }
-    .mini-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
-    .mini-stat { border: 1px solid var(--line); border-radius: 7px; padding: 7px; background: white; min-width: 0; }
-    .mini-stat strong { display: block; font-size: 16px; }
-    .mini-stat span { color: var(--muted); font-size: 11px; }
-    .mini-list { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
-    .mini-list div { overflow-wrap: anywhere; }
-    .watch { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; min-height: 104px; min-width: 0; overflow: hidden; }
-    .watch-title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
-    .watch-title h3 { margin: 0; font-size: 13px; }
-    .watch-title span { color: var(--muted); font-size: 11px; }
-    .watch-list { display: grid; gap: 4px; }
-    .watch-user { border: 1px solid #dce7df; border-left: 5px solid #2f8f46; border-radius: 7px; padding: 4px 7px; background: white; display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 24px; }
-    .watch-user.elevated { border-color: #ead3a8; background: white; }
-    .watch-user.high { border-color: #efc7cc; background: white; }
-    .watch-user.elevated { border-left-color: #d99a2b; }
-    .watch-user.high { border-left-color: var(--danger); }
-    .watch-user-link { display: block; height: auto; min-width: 0; padding: 0; border: 0; border-radius: 0; background: transparent; color: var(--text); font-size: 12px; font-weight: 700; line-height: 1.25; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-    .watch-user-link:hover { color: var(--accent); text-decoration: underline; }
-    .watch-user-link:focus-visible { outline: 2px solid rgba(22, 108, 125, .35); outline-offset: 2px; }
-    .watch-user span { color: var(--muted); display: block; font-size: 11px; white-space: nowrap; }
-    .watch-more { color: var(--muted); font-size: 11px; padding: 1px 2px 0 7px; }
-    pre { margin: 0; padding: 12px; background: #0f172a; color: #dbeafe; border-radius: 8px; overflow: auto; max-height: 520px; font-size: 12px; line-height: 1.45; }
-    @media (max-width: 1100px) {
-      .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 820px) {
-      .dashboard-top { grid-template-columns: 1fr; }
-      .stats { grid-template-columns: 1fr; }
-      .layout { grid-template-columns: 1fr; }
-      aside { min-height: 420px; }
-    }
-    @media (max-width: 700px) {
-      main, header { padding-left: 12px; padding-right: 12px; }
-      .toolbar { grid-template-columns: 1fr; }
-      body { overflow: auto; height: auto; }
-      main { height: auto; }
-      .stats { grid-template-columns: 1fr; }
-      .chart-head { grid-template-columns: 1fr; }
-      .chart-controls { justify-items: start; }
-      .table-scroll { max-height: 65vh; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="brand">
-      <h1>OpenVPN Log Search</h1>
-      <div class="sub" id="sourceLine">Loading authorized CloudConnexa audit logs...</div>
-    </div>
-    <div class="account" id="accountMenu">
-      <button type="button" class="menu-button" id="accountMenuButton" aria-haspopup="true" aria-expanded="false">Account</button>
-      <div class="account-menu" role="menu">
-        <div class="account-name" id="accountName">Not signed in</div>
-        <a href="/admin" role="menuitem">Admin Health</a>
-        <a href="/auth/saml/login" id="loginLink" role="menuitem">Login</a>
-        <a href="/auth/logout" id="logoutLink" role="menuitem">Logout</a>
-        <button type="button" id="settingsButton" role="menuitem">Settings</button>
-      </div>
-    </div>
-  </header>
-  <main>
-    <section class="dashboard-top">
-      <div class="stats" id="stats"></div>
-      <aside class="chart-panel">
-        <div class="chart-head">
-          <h2>Connected Users Over Time</h2>
-          <div class="chart-controls">
-            <select id="connectedRange" aria-label="Connected users time range">
-              <option value="week">Week</option>
-              <option value="month">Month</option>
-              <option value="year">Year</option>
-            </select>
-            <span id="connectedChartMeta">Loading...</span>
-          </div>
-        </div>
-        <div id="connectedChart"></div>
-      </aside>
-      <section class="watch" id="churnWatch">
-        <div class="watch-title"><h3>Reconnect Watch</h3><span>last 24h</span></div>
-        <div class="watch-list"><div class="muted">Loading reconnect activity...</div></div>
-      </section>
-    </section>
-    <form class="toolbar" id="filters">
-      <label>Search
-        <input name="q" autocomplete="off" placeholder="user, IP, operation, device, trace id">
-      </label>
-      <label>Category
-        <select name="category"><option value="">All</option></select>
-      </label>
-      <label>Event
-        <select name="eventName"><option value="">All</option></select>
-      </label>
-      <label>OS
-        <select name="os"><option value="">All</option></select>
-      </label>
-      <label>Gateway
-        <select name="gateway"><option value="">All</option></select>
-      </label>
-      <label>Start
-        <input name="start" placeholder="2026-05-01">
-      </label>
-      <label>End
-        <input name="end" placeholder="2026-05-09">
-      </label>
-      <label>Rows
-        <select name="limit">
-          <option value="1000">1000</option>
-          <option value="300">300</option>
-          <option value="2500">2500</option>
-          <option value="5000">5000</option>
-          <option value="10000">10000</option>
-        </select>
-      </label>
-      <div class="toolbar-actions" aria-label="Toolbar actions">
-        <button type="button" class="secondary" id="clearFilters">Clear</button>
-        <button type="button" class="secondary" id="reload">Reload</button>
-      </div>
-    </form>
-    <div class="status" id="status"></div>
-    <section class="layout" id="layout">
-      <div class="table-scroll">
-        <table id="eventsTable">
-          <colgroup>
-            <col data-col="time">
-            <col data-col="user">
-            <col data-col="event">
-            <col data-col="device">
-            <col data-col="ip">
-            <col data-col="gateway">
-            <col data-col="duration">
-            <col data-col="transfer">
-          </colgroup>
-          <thead>
-            <tr>
-              <th data-col="time"><span class="th-label">Time</span><span class="col-resizer" role="separator" aria-label="Resize Time column"></span></th>
-              <th data-col="user"><span class="th-label">User</span><span class="col-resizer" role="separator" aria-label="Resize User column"></span></th>
-              <th data-col="event"><span class="th-label">Event</span><span class="col-resizer" role="separator" aria-label="Resize Event column"></span></th>
-              <th data-col="device"><span class="th-label">Device</span><span class="col-resizer" role="separator" aria-label="Resize Device column"></span></th>
-              <th data-col="ip"><span class="th-label">IP / Tunnel</span><span class="col-resizer" role="separator" aria-label="Resize IP / Tunnel column"></span></th>
-              <th data-col="gateway"><span class="th-label">Gateway</span><span class="col-resizer" role="separator" aria-label="Resize Gateway column"></span></th>
-              <th data-col="duration"><span class="th-label">Duration</span><span class="col-resizer" role="separator" aria-label="Resize Duration column"></span></th>
-              <th data-col="transfer"><span class="th-label">Transfer</span><span class="col-resizer" role="separator" aria-label="Resize Transfer column"></span></th>
-            </tr>
-          </thead>
-          <tbody id="rows"></tbody>
-        </table>
-        <div class="table-footer" id="tableFooter" hidden>
-          <button type="button" class="secondary" id="loadMore">Load More</button>
-        </div>
-      </div>
-      <aside class="detail-panel" id="detailPanel" hidden>
-        <div class="detail-head">
-          <h2>Event Detail</h2>
-          <button type="button" class="icon-button" id="closeDetail" title="Close event detail" aria-label="Close event detail">&times;</button>
-        </div>
-        <div class="details" id="details">Select a log event.</div>
-      </aside>
-    </section>
-  </main>
-  <dialog id="settingsDialog">
-    <form class="settings" id="settingsForm" method="dialog">
-      <header>
-        <h2>Settings</h2>
-      </header>
-      <section class="settings-grid">
-        <label class="wide">Display timezone
-          <select id="settingsTimeZone"></select>
-        </label>
-      </section>
-      <section class="settings-grid">
-        <h3 class="wide">Log Source</h3>
-        <label>Fetch mode
-          <select name="sourceMode">
-            <option value="http">HTTP bucket listing</option>
-            <option value="s3-api">S3 API with IAM credentials</option>
-          </select>
-        </label>
-        <label>AWS region
-          <input name="sourceRegion" autocomplete="off" placeholder="us-east-1">
-        </label>
-        <label class="wide">S3 bucket URL
-          <input name="sourceBucketUrl" autocomplete="off" placeholder="https://bucket.s3.us-east-1.amazonaws.com/">
-        </label>
-        <label>S3 bucket name
-          <input name="sourceBucketName" autocomplete="off" placeholder="bucket-name">
-        </label>
-        <label>Log prefix
-          <input name="sourceLogPrefix" autocomplete="off" placeholder="CloudConnexa/wellesley/">
-        </label>
-        <div class="muted wide" id="sourceCredentialStatus"></div>
-      </section>
-      <section class="settings-grid">
-        <h3 class="wide">SAML 2.0 SSO</h3>
-        <label class="check-row"><input type="checkbox" name="enabled"> Enable SAML login</label>
-        <label class="check-row"><input type="checkbox" name="requireAuth"> Require SSO for API access</label>
-        <label>SP entity ID
-          <input name="issuer" autocomplete="off">
-        </label>
-        <label>SP ACS callback URL
-          <input name="callbackUrl" autocomplete="off" placeholder="Auto-generated if blank">
-        </label>
-        <label>IdP login URL
-          <input name="entryPoint" autocomplete="off">
-        </label>
-        <label>IdP logout URL
-          <input name="logoutUrl" autocomplete="off">
-        </label>
-        <label class="wide">Audience
-          <input name="audience" autocomplete="off" placeholder="Defaults to SP entity ID">
-        </label>
-        <label class="wide">IdP signing certificate
-          <textarea name="idpCert" spellcheck="false"></textarea>
-        </label>
-        <label class="check-row"><input type="checkbox" name="wantAssertionsSigned"> Require signed assertions</label>
-        <label class="check-row"><input type="checkbox" name="wantAuthnResponseSigned"> Require signed responses</label>
-        <label class="check-row wide"><input type="checkbox" name="disableRequestedAuthnContext"> Let the IdP choose auth context</label>
-        <label class="wide">SP metadata URL
-          <input id="metadataUrl" readonly>
-        </label>
-      </section>
-      <div class="settings-actions">
-        <button type="button" class="secondary" id="closeSettings">Close</button>
-        <button type="submit">Save Settings</button>
-      </div>
-    </form>
-  </dialog>
-  <script>
-    const filters = document.querySelector("#filters");
-    const rows = document.querySelector("#rows");
-    const tableFooter = document.querySelector("#tableFooter");
-    const loadMoreButton = document.querySelector("#loadMore");
-    const eventsTable = document.querySelector("#eventsTable");
-    const layout = document.querySelector("#layout");
-    const statusEl = document.querySelector("#status");
-    const details = document.querySelector("#details");
-    const detailPanel = document.querySelector("#detailPanel");
-    const churnWatch = document.querySelector("#churnWatch");
-    const statsEl = document.querySelector("#stats");
-    const connectedChart = document.querySelector("#connectedChart");
-    const connectedChartMeta = document.querySelector("#connectedChartMeta");
-    const connectedRange = document.querySelector("#connectedRange");
-    const sourceLine = document.querySelector("#sourceLine");
-    const closeDetail = document.querySelector("#closeDetail");
-    const accountMenu = document.querySelector("#accountMenu");
-    const accountMenuButton = document.querySelector("#accountMenuButton");
-    const accountName = document.querySelector("#accountName");
-    const loginLink = document.querySelector("#loginLink");
-    const logoutLink = document.querySelector("#logoutLink");
-    const settingsButton = document.querySelector("#settingsButton");
-    const settingsDialog = document.querySelector("#settingsDialog");
-    const settingsForm = document.querySelector("#settingsForm");
-    const settingsTimeZone = document.querySelector("#settingsTimeZone");
-    const sourceCredentialStatus = document.querySelector("#sourceCredentialStatus");
-    const closeSettings = document.querySelector("#closeSettings");
-    const metadataUrl = document.querySelector("#metadataUrl");
-    const IDLE_RELOAD_MS = 30 * 60 * 1000;
-    const TIME_ZONE_STORAGE_KEY = "openvpnLogBrowserTimeZone";
-    const COLUMN_WIDTH_STORAGE_KEY = "openvpnLogBrowserColumnWidths";
-    const defaultColumnWidths = {
-      time: 205,
-      user: 210,
-      event: 150,
-      device: 230,
-      ip: 250,
-      gateway: 230,
-      duration: 105,
-      transfer: 110
-    };
-    const minColumnWidths = {
-      time: 150,
-      user: 130,
-      event: 105,
-      device: 150,
-      ip: 160,
-      gateway: 150,
-      duration: 88,
-      transfer: 90
-    };
-    const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-    const timeZones = Array.from(new Set([
-      localTimeZone,
-      "UTC",
-      "America/New_York",
-      "America/Chicago",
-      "America/Denver",
-      "America/Los_Angeles",
-      "Europe/London"
-    ]));
-    let selectedTimeZone = validTimeZone(localStorage.getItem(TIME_ZONE_STORAGE_KEY) || localTimeZone);
-    if (!timeZones.includes(selectedTimeZone)) timeZones.unshift(selectedTimeZone);
-    let selectedRecordId = "";
-    let nextSearchCursor = "";
-    let lastSearchMeta = { searched: 0, total: 0, totalIsExact: true, shown: 0, limit: 0 };
-    let idleReloadTimer;
-    let loadingPollTimer;
-
-    async function getJson(url, options) {
-      const res = await fetch(url, options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || res.statusText);
-      return data;
-    }
-
-    function esc(value) {
-      return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
-    }
-
-    function params() {
-      const form = new FormData(filters);
-      const out = new URLSearchParams();
-      for (const [key, value] of form.entries()) if (String(value).trim()) out.set(key, String(value).trim());
-      return out;
-    }
-
-    async function loadFacets() {
-      const data = await getJson("/api/facets");
-      fill("category", data.categories);
-      fill("eventName", data.eventNames);
-      fill("os", data.operatingSystems);
-      fill("gateway", data.gateways);
-    }
-
-    async function loadChurnWatch() {
-      const data = await getJson("/api/churn?limit=8");
-      churnWatch.innerHTML = '<div class="watch-title"><h3>Reconnect Watch</h3><span>last ' + esc(data.windowHours) + 'h</span></div>' +
-        '<div class="watch-list">' + renderChurnUsers(data.users || [], data.excessiveCount) + '</div>';
-    }
-
-    function renderChurnUsers(users, excessiveCount) {
-      if (!users.length) return '<div class="muted">Loading reconnect activity...</div>';
-      const prioritized = excessiveCount ? users.filter(user => user.severity === "high" || user.severity === "elevated") : users;
-      const rows = prioritized.slice(0, 4);
-      if (!rows.length) return '<div class="muted">No excessive reconnect pattern detected.</div>';
-      const more = prioritized.length > rows.length ? '<div class="watch-more">+' + esc(prioritized.length - rows.length) + ' more</div>' : "";
-      return rows.map(user => '<div class="watch-user ' + esc(user.severity) + '">' +
-        '<button type="button" class="watch-user-link" data-user="' + esc(user.userName) + '" title="Search events for ' + esc(user.userName) + '">' + esc(user.userName) + '</button>' +
-        '<span>' + esc(user.total) + ' events</span>' +
-      '</div>').join("") + more;
-    }
-
-    function loadColumnWidths() {
-      try {
-        return { ...defaultColumnWidths, ...JSON.parse(localStorage.getItem(COLUMN_WIDTH_STORAGE_KEY) || "{}") };
-      } catch {
-        return { ...defaultColumnWidths };
-      }
-    }
-
-    function saveColumnWidths(widths) {
-      localStorage.setItem(COLUMN_WIDTH_STORAGE_KEY, JSON.stringify(widths));
-    }
-
-    function applyColumnWidths(widths = loadColumnWidths()) {
-      for (const col of eventsTable.querySelectorAll("col[data-col]")) {
-        const key = col.dataset.col;
-        const min = minColumnWidths[key] || 80;
-        const width = Math.max(min, Number(widths[key] || defaultColumnWidths[key] || min));
-        col.style.width = width + "px";
-      }
-    }
-
-    function setupResizableColumns() {
-      applyColumnWidths();
-      eventsTable.querySelectorAll("th[data-col]").forEach(th => {
-        const handle = th.querySelector(".col-resizer");
-        if (!handle) return;
-        handle.addEventListener("pointerdown", event => {
-          event.preventDefault();
-          event.stopPropagation();
-          const key = th.dataset.col;
-          const widths = loadColumnWidths();
-          const startX = event.clientX;
-          const startWidth = Number(widths[key] || th.getBoundingClientRect().width || defaultColumnWidths[key]);
-          const min = minColumnWidths[key] || 80;
-          document.body.classList.add("resizing-columns");
-          handle.setPointerCapture(event.pointerId);
-
-          const move = moveEvent => {
-            widths[key] = Math.max(min, Math.round(startWidth + moveEvent.clientX - startX));
-            applyColumnWidths(widths);
-          };
-          const up = () => {
-            document.body.classList.remove("resizing-columns");
-            saveColumnWidths(widths);
-            handle.removeEventListener("pointermove", move);
-            handle.removeEventListener("pointerup", up);
-            handle.removeEventListener("pointercancel", up);
-          };
-
-          handle.addEventListener("pointermove", move);
-          handle.addEventListener("pointerup", up);
-          handle.addEventListener("pointercancel", up);
-        });
-      });
-    }
-
-    async function loadAuth() {
-      const data = await getJson("/api/auth");
-      accountName.textContent = data.user && data.user.authenticated
-        ? (data.user.email || data.user.name || "Signed in")
-        : "Not signed in";
-      loginLink.style.display = data.saml && data.saml.ready ? "flex" : "none";
-      logoutLink.style.display = data.user && data.user.authenticated ? "flex" : "none";
-      accountMenuButton.textContent = data.user && data.user.authenticated ? "Account" : "Menu";
-      return data;
-    }
-
-    async function loadSettings() {
-      fillTimeZoneSettings();
-      const source = await getJson("/api/settings/source");
-      settingsForm.elements.sourceMode.value = source.mode || "http";
-      settingsForm.elements.sourceBucketUrl.value = source.bucketUrl || "";
-      settingsForm.elements.sourceBucketName.value = source.bucketName || "";
-      settingsForm.elements.sourceRegion.value = source.region || "";
-      settingsForm.elements.sourceLogPrefix.value = source.logPrefix || "";
-      sourceCredentialStatus.textContent = source.mode === "s3-api"
-        ? (source.hasIamCredentialEnv ? "IAM credential environment detected." : "IAM credentials are read from the service environment or instance role.")
-        : "HTTP mode uses bucket policy access.";
-      const saml = await getJson("/api/settings/saml");
-      settingsForm.elements.enabled.checked = Boolean(saml.enabled);
-      settingsForm.elements.requireAuth.checked = Boolean(saml.requireAuth);
-      settingsForm.elements.issuer.value = saml.issuer || "";
-      settingsForm.elements.callbackUrl.value = saml.callbackUrl || "";
-      settingsForm.elements.entryPoint.value = saml.entryPoint || "";
-      settingsForm.elements.logoutUrl.value = saml.logoutUrl || "";
-      settingsForm.elements.audience.value = saml.audience || "";
-      settingsForm.elements.idpCert.value = saml.idpCert || "";
-      settingsForm.elements.wantAssertionsSigned.checked = Boolean(saml.wantAssertionsSigned);
-      settingsForm.elements.wantAuthnResponseSigned.checked = Boolean(saml.wantAuthnResponseSigned);
-      settingsForm.elements.disableRequestedAuthnContext.checked = Boolean(saml.disableRequestedAuthnContext);
-      metadataUrl.value = saml.metadataUrl || "";
-    }
-
-    function fillTimeZoneSettings() {
-      settingsTimeZone.innerHTML = timeZones.map(zone =>
-        '<option value="' + esc(zone) + '"' + (zone === selectedTimeZone ? " selected" : "") + '>' + esc(zoneLabel(zone)) + '</option>'
-      ).join("");
-    }
-
-    async function saveSettings() {
-      selectedTimeZone = validTimeZone(settingsTimeZone.value);
-      localStorage.setItem(TIME_ZONE_STORAGE_KEY, selectedTimeZone);
-      await getJson("/api/settings/source", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: settingsForm.elements.sourceMode.value,
-          bucketUrl: settingsForm.elements.sourceBucketUrl.value,
-          bucketName: settingsForm.elements.sourceBucketName.value,
-          region: settingsForm.elements.sourceRegion.value,
-          logPrefix: settingsForm.elements.sourceLogPrefix.value
-        })
-      });
-      await getJson("/api/settings/saml", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          enabled: settingsForm.elements.enabled.checked,
-          requireAuth: settingsForm.elements.requireAuth.checked,
-          issuer: settingsForm.elements.issuer.value,
-          callbackUrl: settingsForm.elements.callbackUrl.value,
-          entryPoint: settingsForm.elements.entryPoint.value,
-          logoutUrl: settingsForm.elements.logoutUrl.value,
-          audience: settingsForm.elements.audience.value,
-          idpCert: settingsForm.elements.idpCert.value,
-          wantAssertionsSigned: settingsForm.elements.wantAssertionsSigned.checked,
-          wantAuthnResponseSigned: settingsForm.elements.wantAuthnResponseSigned.checked,
-          disableRequestedAuthnContext: settingsForm.elements.disableRequestedAuthnContext.checked
-        })
-      });
-      settingsDialog.close();
-      await loadAuth();
-      await loadStats();
-      await loadConnectedChart();
-      await search();
-      if (selectedRecordId) await selectRecord(selectedRecordId);
-    }
-
-    async function loadConnectedChart() {
-      const data = await getJson("/api/connected-users?range=" + encodeURIComponent(connectedRange.value));
-      renderConnectedChart(data);
-    }
-
-    function renderConnectedChart(data) {
-      const points = data.points || [];
-      connectedChartMeta.textContent = points.length
-        ? "excluding " + (data.excludedUsers ?? latestExcluded(points)) + " reconnect-heavy users"
-        : "No connection data loaded";
-      if (!points.length) {
-        connectedChart.innerHTML = '<div class="muted">Loading connection trend...</div>';
-        return;
-      }
-
-      const width = Math.max(340, Math.round(connectedChart.clientWidth || 540));
-      const height = 92;
-      const pad = { top: 8, right: 10, bottom: 18, left: 26 };
-      const max = Math.max(1, ...points.map(point => point.connectedUsers));
-      const plotW = width - pad.left - pad.right;
-      const plotH = height - pad.top - pad.bottom;
-      const x = index => pad.left + (points.length === 1 ? 0 : (index / (points.length - 1)) * plotW);
-      const y = value => pad.top + plotH - (value / max) * plotH;
-      const line = points.map((point, index) => x(index).toFixed(1) + "," + y(point.connectedUsers).toFixed(1)).join(" ");
-      const area = pad.left + "," + (pad.top + plotH) + " " + line + " " + (pad.left + plotW) + "," + (pad.top + plotH);
-      const last = points[points.length - 1];
-      const grid = [0, .5, 1].map(part => {
-        const gy = pad.top + plotH - part * plotH;
-        const label = Math.round(max * part);
-        return '<line class="chart-grid" x1="' + pad.left + '" y1="' + gy + '" x2="' + (pad.left + plotW) + '" y2="' + gy + '"></line>' +
-          '<text class="chart-label" x="4" y="' + (gy + 4) + '">' + esc(label) + '</text>';
-      }).join("");
-      connectedChart.innerHTML = '<svg class="chart" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="Connected users over time">' +
-        grid +
-        '<polygon class="chart-area" points="' + area + '"></polygon>' +
-        '<polyline class="chart-line" points="' + line + '"></polyline>' +
-        '<circle class="chart-dot" cx="' + x(points.length - 1).toFixed(1) + '" cy="' + y(last.connectedUsers).toFixed(1) + '" r="3"></circle>' +
-        '<text class="chart-label" x="' + pad.left + '" y="' + (height - 6) + '">' + esc(shortTime(points[0].timestamp)) + '</text>' +
-        '<text class="chart-label" text-anchor="end" x="' + (pad.left + plotW) + '" y="' + (height - 6) + '">' + esc(shortTime(last.timestamp)) + '</text>' +
-        '<text class="chart-label" text-anchor="end" x="' + (pad.left + plotW - 8) + '" y="' + Math.max(16, y(last.connectedUsers) - 8) + '">' + esc(last.connectedUsers) + ' users</text>' +
-      '</svg>';
-    }
-
-    function latestExcluded(points) {
-      const last = points[points.length - 1];
-      return last && Number.isFinite(Number(last.excludedUsers)) ? Number(last.excludedUsers) : 0;
-    }
-
-    function shortTime(value) {
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString([], { timeZone: selectedTimeZone, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-    }
-
-    function displayTime(value) {
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value || "";
-      return date.toLocaleString([], {
-        timeZone: selectedTimeZone,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: false,
-        timeZoneName: "short"
-      });
-    }
-
-    function validTimeZone(zone) {
-      try {
-        Intl.DateTimeFormat([], { timeZone: zone }).format(new Date());
-        return zone;
-      } catch {
-        return localTimeZone;
-      }
-    }
-
-    function fill(name, values) {
-      const select = filters.elements[name];
-      const current = select.value;
-      select.innerHTML = '<option value="">All</option>' + values.map(value => '<option>' + esc(value) + '</option>').join("");
-      select.value = current;
-    }
-
-    async function loadStats() {
-      const data = await getJson("/api/stats?timeZone=" + encodeURIComponent(selectedTimeZone));
-      sourceLine.textContent = data.source + " | loaded " + (data.loadedAt ? displayTime(data.loadedAt) : "never");
-      statusEl.textContent = data.loading ? "Loading logs..." : (data.error || "");
-      statusEl.className = data.error ? "status error" : "status";
-      statsEl.innerHTML = [
-        stat("Active users", data.activeUsers + " users / " + data.activeSessions + " sessions")
-      ].join("");
-      scheduleLoadingPoll(data.loading);
-      return data;
-    }
-
-    function stat(label, value) {
-      return '<div class="stat"><strong>' + esc(value) + '</strong><span>' + esc(label) + '</span></div>';
-    }
-
-    function zoneLabel(zone) {
-      return zone === localTimeZone ? "Local (" + zone + ")" : zone;
-    }
-
-    async function search(options = {}) {
-      const append = Boolean(options.append);
-      const query = params();
-      if (append && nextSearchCursor) query.set("cursor", nextSearchCursor);
-      const data = await getJson("/api/search?" + query);
-      nextSearchCursor = data.nextCursor || "";
-      lastSearchMeta = {
-        searched: data.searched,
-        total: data.total,
-        totalIsExact: data.totalIsExact !== false,
-        shown: append ? lastSearchMeta.shown + data.rows.length : data.rows.length,
-        limit: data.limit
-      };
-      renderSearchStatus(data);
-      const html = data.rows.map(record => '<tr data-id="' + esc(record.id) + '"' + (record.id === selectedRecordId ? ' class="selected"' : "") + '>' +
-        '<td class="time">' + esc(displayTime(record.timestamp)) + '</td>' +
-        '<td class="user wrap">' + esc(record.userName || record.initiatorName) + '</td>' +
-        '<td><span class="chip">' + esc(record.eventName || record.operation || "event") + '</span></td>' +
-        '<td class="wrap">' + esc(record.deviceName || record.entityName) + '<br><span class="muted">' + esc(record.os) + '</span></td>' +
-        '<td class="ip wrap">' + esc(record.publicIp) + '<br><span class="muted">' + esc(record.tunnelIp) + '</span></td>' +
-        '<td class="wrap">' + esc(record.gateway || record.gatewayRegion) + '<br><span class="muted">' + esc(record.protocol) + '</span></td>' +
-        '<td>' + esc(formatDuration(record.durationSeconds)) + '</td>' +
-        '<td>' + esc(formatBytes((record.bytesIn || 0) + (record.bytesOut || 0))) + '</td>' +
-      '</tr>').join("");
-      rows.innerHTML = append ? rows.innerHTML + html : html;
-      tableFooter.hidden = !data.hasMore;
-      loadMoreButton.disabled = !data.hasMore;
-      highlightSelectedRow();
-    }
-
-    function renderSearchStatus(data) {
-      const exact = data.totalIsExact !== false;
-      const matched = exact ? data.total + " matched" : "many matched";
-      const prefix = statusEl.className.includes("error") ? statusEl.textContent + " | " : "";
-      statusEl.textContent = prefix + "searched " + data.searched + " loaded events; " + matched + "; showing " + lastSearchMeta.shown + (data.hasMore ? "+" : "") + " of " + data.limit;
-    }
-
-    async function selectRecord(id) {
-      selectedRecordId = id;
-      const record = await getJson("/api/record?id=" + encodeURIComponent(id));
-      detailPanel.hidden = false;
-      layout.classList.add("detail-open");
-      closeDetail.style.display = "inline-flex";
-      details.innerHTML = '<div class="kv">' +
-        kv("Timestamp", displayTime(record.timestamp)) +
-        kv("Event", record.eventName || record.operation) +
-        kv("User", record.userName || record.initiatorName) +
-        kv("Device", record.deviceName || record.entityName) +
-        kv("Public IP", record.publicIp) +
-        kv("Tunnel IP", record.tunnelIp) +
-        kv("Gateway", record.gateway) +
-        kv("OS", record.os) +
-        kv("Protocol", record.protocol) +
-        kv("Session ID", record.sessionId) +
-        kv("Duration", formatDuration(record.durationSeconds)) +
-        kv("Transfer", formatBytes((record.bytesIn || 0) + (record.bytesOut || 0))) +
-        kv("Disconnect", record.disconnectReason) +
-        kv("Trace ID", record.traceId) +
-        kv("Source", record.sourceKey + ":" + record.lineNumber) +
-      '</div>' + churnPanel(record.churn) + '<pre>' + esc(JSON.stringify(record.raw, null, 2)) + '</pre>';
-      highlightSelectedRow();
-    }
-
-    function clearSelectedRecord() {
-      selectedRecordId = "";
-      detailPanel.hidden = true;
-      layout.classList.remove("detail-open");
-      closeDetail.style.display = "none";
-      details.textContent = "";
-      highlightSelectedRow();
-    }
-
-    function highlightSelectedRow() {
-      for (const tr of rows.querySelectorAll("tr")) {
-        tr.classList.toggle("selected", Boolean(selectedRecordId) && tr.dataset.id === selectedRecordId);
-      }
-    }
-
-    function kv(key, value) {
-      return '<div>' + esc(key) + '</div><div>' + esc(value || "-") + '</div>';
-    }
-
-    function churnPanel(churn) {
-      if (!churn) return "";
-      const recent = (churn.latest || []).map(item => '<div>' +
-        esc(displayTime(item.timestamp)) + " | " +
-        esc(item.eventName) + " | " +
-        esc(item.deviceName || "-") + " | " +
-        esc(item.publicIp || "-") +
-        (item.durationSeconds ? " | " + esc(formatDuration(item.durationSeconds)) : "") +
-      '</div>').join("");
-      return '<section class="churn ' + esc(churn.severity) + '">' +
-        '<h3>Reconnect Activity</h3>' +
-        '<div class="summary">' + esc(churn.message) + '</div>' +
-        '<div class="mini-grid">' +
-          miniStat(churn.connected, "connects") +
-          miniStat(churn.disconnected, "disconnects") +
-          miniStat(churn.shortSessions, "short sessions") +
-          miniStat(formatDuration(churn.connectedForSeconds), "connected for") +
-          miniStat(formatBytes(churn.totalTransfer), "transfer") +
-        '</div>' +
-        '<div class="mini-list">' + (recent || '<div>No recent connection events for this user.</div>') + '</div>' +
-      '</section>';
-    }
-
-    function miniStat(value, label) {
-      return '<div class="mini-stat"><strong>' + esc(value) + '</strong><span>' + esc(label) + '</span></div>';
-    }
-
-    closeDetail.addEventListener("click", () => {
-      clearSelectedRecord();
-    });
-
-    function resetIdleReloadTimer() {
-      clearTimeout(idleReloadTimer);
-      idleReloadTimer = setTimeout(async () => {
-        statusEl.textContent = "Idle refresh...";
-        try {
-          await getJson("/api/reload", { method: "POST" });
-          await boot();
-        } catch (error) {
-          showError(error);
-        } finally {
-          resetIdleReloadTimer();
-        }
-      }, IDLE_RELOAD_MS);
-    }
-
-    ["click", "keydown", "mousemove", "scroll", "touchstart"].forEach(eventName => {
-      window.addEventListener(eventName, resetIdleReloadTimer, { passive: true });
-    });
-
-    function formatDuration(seconds) {
-      seconds = Number(seconds || 0);
-      if (!seconds) return "-";
-      const h = Math.floor(seconds / 3600);
-      const m = Math.floor((seconds % 3600) / 60);
-      const s = seconds % 60;
-      if (h) return h + "h " + m + "m";
-      if (m) return m + "m " + s + "s";
-      return s + "s";
-    }
-
-    function formatBytes(bytes) {
-      bytes = Number(bytes || 0);
-      if (!bytes) return "-";
-      const units = ["B", "KB", "MB", "GB", "TB"];
-      let value = bytes;
-      let unit = 0;
-      while (value >= 1024 && unit < units.length - 1) {
-        value /= 1024;
-        unit += 1;
-      }
-      return (value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)) + " " + units[unit];
-    }
-
-    filters.addEventListener("input", () => search().catch(showError));
-    filters.addEventListener("change", () => search().catch(showError));
-    churnWatch.addEventListener("click", event => {
-      const link = event.target.closest(".watch-user-link");
-      if (!link) return;
-      filters.elements.q.value = link.dataset.user || "";
-      search().catch(showError);
-    });
-    rows.addEventListener("click", event => {
-      const tr = event.target.closest("tr");
-      if (!tr || !tr.dataset.id) return;
-      if (tr.dataset.id === selectedRecordId) {
-        clearSelectedRecord();
-      } else {
-        selectRecord(tr.dataset.id).catch(showError);
-      }
-    });
-    loadMoreButton.addEventListener("click", () => search({ append: true }).catch(showError));
-    document.querySelector("#reload").addEventListener("click", async () => {
-      statusEl.textContent = "Reloading...";
-      await getJson("/api/reload", { method: "POST" });
-      await boot();
-    });
-    document.querySelector("#clearFilters").addEventListener("click", () => {
-      filters.reset();
-      search().catch(showError);
-    });
-    connectedRange.addEventListener("change", () => loadConnectedChart().catch(showError));
-    accountMenuButton.addEventListener("click", () => {
-      const open = !accountMenu.classList.contains("open");
-      accountMenu.classList.toggle("open", open);
-      accountMenuButton.setAttribute("aria-expanded", String(open));
-    });
-    document.addEventListener("click", (event) => {
-      if (!accountMenu.contains(event.target)) {
-        accountMenu.classList.remove("open");
-        accountMenuButton.setAttribute("aria-expanded", "false");
-      }
-    });
-    settingsButton.addEventListener("click", async () => {
-      accountMenu.classList.remove("open");
-      await loadSettings();
-      settingsDialog.showModal();
-    });
-    closeSettings.addEventListener("click", () => settingsDialog.close());
-    settingsForm.addEventListener("submit", (event) => {
-      event.preventDefault();
-      saveSettings().catch(showError);
-    });
-
-    function showError(error) {
-      statusEl.textContent = error.message;
-      statusEl.className = "status error";
-    }
-
-    async function boot() {
-      await loadAuth();
-      applyColumnWidths();
-      await loadStats();
-      await loadFacets();
-      await loadChurnWatch();
-      await loadConnectedChart();
-      await search();
-      resetIdleReloadTimer();
-    }
-
-    function scheduleLoadingPoll(isLoading) {
-      clearTimeout(loadingPollTimer);
-      if (!isLoading) return;
-      loadingPollTimer = setTimeout(() => {
-        boot().catch(showError);
-      }, 5000);
-    }
-
-    setupResizableColumns();
-    boot().catch(showError);
-  </script>
-</body>
-</html>`;
+const INDEX_HTML = fsSync.readFileSync(path.join(__dirname, "public", "index.html"), "utf8");
 
 if (process.argv.includes("--ingest")) {
   runIngestOnce().catch((error) => {
@@ -3745,6 +2778,10 @@ if (process.argv.includes("--ingest")) {
 } else {
   http.createServer(handler).listen(PORT, () => {
     console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
+    if (!adminConfigured()) {
+      console.warn("SECURITY WARNING: ADMIN_SETUP_TOKEN/ADMIN_EMAILS are not set. Settings changes (/api/settings/saml, /api/settings/source) are disabled until one is configured.");
+    }
+    setInterval(sweepExpiredSessions, 15 * 60 * 1000);
     initializeApp().then(() => {
       if (WEB_INGEST_ENABLED) {
         refresh().catch((error) => {

@@ -33,6 +33,8 @@ Then open `http://localhost:3000`.
 
 Node.js 18 or newer is required for SAML 2.0 SSO support.
 
+The main page and admin health page are static HTML in [public/index.html](public/index.html) and [public/admin.html](public/admin.html); `server.js` reads them at startup, so both files must ship alongside `server.js`.
+
 You can also verify ingestion without starting the web server:
 
 ```powershell
@@ -64,6 +66,15 @@ WEB_INGEST_ENABLED=false
 LOG_INDEX_RETENTION_DAYS=0
 SLOW_API_MS=500
 SLOW_DB_MS=500
+
+# Admin access for Menu -> Settings (POST /api/settings/saml, /api/settings/source).
+# At least one of these must be set or settings changes are rejected with 403.
+ADMIN_SETUP_TOKEN=
+ADMIN_EMAILS=
+
+# Session behavior.
+SESSION_IDLE_TIMEOUT_MINUTES=720
+TRUST_PROXY=false
 
 # Log source.
 S3_FETCH_MODE=http
@@ -116,6 +127,17 @@ Slow API and database calls are logged to the service journal when they exceed `
 The aggregate count history is stored in `connected_user_counts`. Samples older than 365 days are deleted automatically.
 
 SAML settings can also be managed in the app from `Menu` -> `Settings`. The app exposes SP metadata at `/auth/saml/metadata` after SAML is configured.
+
+## Admin Access
+
+`POST /api/settings/saml` and `POST /api/settings/source` (the settings dialog's Save button) change how the app authenticates users and where it reads logs from, so they require an admin credential. Configure at least one of:
+
+- `ADMIN_SETUP_TOKEN` - a shared secret. Send it as `X-Admin-Token: <token>` or `Authorization: Bearer <token>` when calling the settings endpoints directly. Use this to bootstrap SAML before any SSO session exists.
+- `ADMIN_EMAILS` - a comma-separated allowlist of SAML `email` claims. Any authenticated SAML session whose email matches is treated as an admin.
+
+If neither is set, settings changes are rejected with `403` and the server logs a startup warning. Reading settings (`GET /api/settings/saml`, `GET /api/settings/source`) is not gated, since it returns no secrets (the IdP certificate is a public certificate, not a private key).
+
+Sessions expire after `SESSION_IDLE_TIMEOUT_MINUTES` (default `720`, i.e. 12 hours) of inactivity. Set `TRUST_PROXY=true` only when the app sits behind a reverse proxy you control that sets `X-Forwarded-Proto` correctly; this affects SAML callback/metadata URL generation and whether the session cookie is marked `Secure`. Leaving it `false` (the default) derives the protocol from the actual TCP connection instead of trusting a client-settable header.
 
 ## Log Source Settings
 

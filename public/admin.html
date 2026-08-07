@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenVPN Log Search Admin</title>
+  <style>
+    :root { color-scheme: light; --bg:#f7f8fb; --panel:#fff; --text:#18202b; --muted:#667085; --line:#d9dee8; --accent:#166c7d; --danger:#9f2936; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); }
+    header { min-height: 58px; padding: 12px 20px; background: #101827; color: white; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1, h2 { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 18px; }
+    h2 { font-size: 15px; }
+    a { color: inherit; }
+    main { padding: 16px; display: grid; gap: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+    .wide { grid-column: span 2; }
+    .full { grid-column: 1 / -1; }
+    .stat { display: grid; gap: 4px; }
+    .stat strong { font-size: 22px; }
+    .muted, .label { color: var(--muted); font-size: 12px; }
+    .ok { color: #166534; }
+    .bad { color: var(--danger); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; font-weight: 700; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .button { height: 34px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--accent); background: var(--accent); color: white; display: inline-flex; align-items: center; text-decoration: none; font-weight: 700; }
+    .button.secondary { background: white; color: var(--accent); }
+    @media (max-width: 1000px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .wide { grid-column: 1 / -1; } }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>OpenVPN Log Search Admin</h1>
+      <div class="muted" id="generated">Loading health...</div>
+    </div>
+    <div class="actions">
+      <a class="button secondary" href="/">Events</a>
+      <a class="button" href="/api/connected-users/export?range=year">Export Licensing CSV</a>
+    </div>
+  </header>
+  <main>
+    <section class="grid">
+      <div class="panel stat"><span class="label">Status</span><strong id="status">-</strong></div>
+      <div class="panel stat"><span class="label">Records</span><strong id="records">-</strong></div>
+      <div class="panel stat"><span class="label">Active Users</span><strong id="active">-</strong></div>
+      <div class="panel stat"><span class="label">Memory RSS</span><strong id="rss">-</strong></div>
+      <div class="panel wide"><h2>Runtime</h2><div id="runtime"></div></div>
+      <div class="panel wide"><h2>Configuration</h2><div id="config"></div></div>
+      <div class="panel wide"><h2>Cache Ages</h2><table><thead><tr><th>Cache</th><th>Generated</th><th>Age</th></tr></thead><tbody id="caches"></tbody></table></div>
+      <div class="panel wide"><h2>MariaDB Tables</h2><table><thead><tr><th>Table</th><th>Rows</th><th>Data</th><th>Index</th></tr></thead><tbody id="tables"></tbody></table></div>
+      <div class="panel full"><h2>Indexes</h2><div id="indexes"></div></div>
+      <div class="panel full"><h2>Recent Slow Calls</h2><table><thead><tr><th>Time</th><th>Kind</th><th>Label</th><th>ms</th></tr></thead><tbody id="slow"></tbody></table></div>
+    </section>
+  </main>
+  <script>
+    const fmt = new Intl.NumberFormat();
+    const bytes = value => {
+      value = Number(value || 0);
+      const units = ["B","KB","MB","GB","TB"];
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+      return (value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)) + " " + units[unit];
+    };
+    const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
+    const row = items => "<tr>" + items.map(item => "<td>" + item + "</td>").join("") + "</tr>";
+    const kv = obj => Object.entries(obj || {}).map(([key, value]) => "<div><span class='label'>" + esc(key) + "</span><br><code>" + esc(value) + "</code></div>").join("<br>");
+    const age = value => {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "-";
+      const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+      if (seconds < 60) return seconds + "s";
+      if (seconds < 3600) return Math.round(seconds / 60) + "m";
+      return Math.round(seconds / 3600) + "h";
+    };
+    async function load() {
+      const res = await fetch("/api/health");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      document.querySelector("#generated").textContent = "Generated " + new Date(data.generatedAt).toLocaleString();
+      document.querySelector("#status").textContent = data.status;
+      document.querySelector("#status").className = data.status === "ok" ? "ok" : "bad";
+      document.querySelector("#records").textContent = fmt.format(data.app.records);
+      document.querySelector("#active").textContent = fmt.format(data.app.activeUsers) + " / " + fmt.format(data.app.activeSessions);
+      document.querySelector("#rss").textContent = bytes(data.process.rssBytes);
+      document.querySelector("#runtime").innerHTML = kv({ pid: data.process.pid, uptimeSeconds: data.process.uptimeSeconds, node: data.process.node, mysql: data.mysql.status, loadedAt: data.app.loadedAt || "", source: data.app.source || "" });
+      document.querySelector("#config").innerHTML = kv(data.config);
+      document.querySelector("#caches").innerHTML = (data.mysql.caches || []).map(item => row([esc(item.name), esc(item.generatedAt || "-"), esc(age(item.generatedAt))])).join("");
+      document.querySelector("#tables").innerHTML = (data.mysql.tables || []).map(item => row([esc(item.name), fmt.format(item.estimatedRows), bytes(item.dataBytes), bytes(item.indexBytes)])).join("");
+      document.querySelector("#indexes").innerHTML = (data.mysql.indexes || []).map(item => "<code>" + esc(item) + "</code>").join(" ");
+      document.querySelector("#slow").innerHTML = (data.slowEvents || []).map(item => row([esc(new Date(item.timestamp).toLocaleString()), esc(item.kind), esc(item.label), fmt.format(item.elapsedMs)])).join("") || row(["-", "No slow calls recorded in this process", "-", "-"]);
+    }
+    load().catch(error => { document.querySelector("#status").textContent = error.message; document.querySelector("#status").className = "bad"; });
+  </script>
+</body>
+</html>
