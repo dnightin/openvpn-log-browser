@@ -188,6 +188,7 @@ export async function mount(root, routeParams) {
   });
 
   let detailPanel = null;
+  let paneContent = { normalized: "", raw: "", churn: "" };
 
   function buildParams(cursor) {
     const params = new URLSearchParams();
@@ -346,21 +347,28 @@ export async function mount(root, routeParams) {
         '<button type="button" class="detail-tab" data-tab="raw">Raw JSON</button>' +
         '<button type="button" class="detail-tab" data-tab="churn">Reconnect activity</button>' +
       "</div>" +
-      '<div class="detail-body">' +
-        '<div class="detail-pane" data-pane="normalized"></div>' +
-        '<div class="detail-pane" data-pane="raw" hidden></div>' +
-        '<div class="detail-pane" data-pane="churn" hidden></div>' +
-      "</div>";
+      '<div class="detail-body" id="detailBody"></div>';
     layout.appendChild(detailPanel);
     detailPanel.querySelector("#closeDetail").addEventListener("click", closeDetail);
     detailPanel.querySelectorAll(".detail-tab").forEach((tab) => {
       tab.addEventListener("click", () => {
         state.activeTab = tab.dataset.tab;
         detailPanel.querySelectorAll(".detail-tab").forEach((t) => t.classList.toggle("active", t === tab));
-        detailPanel.querySelectorAll(".detail-pane").forEach((pane) => { pane.hidden = pane.dataset.pane !== state.activeTab; });
+        renderActivePane();
       });
     });
     return detailPanel;
+  }
+
+  // Re-renders the single active pane's content via innerHTML, the same
+  // mechanism selectRecord() already uses reliably for the initial load.
+  // Deliberately does NOT pre-render all three panes and toggle a hidden
+  // attribute/CSS class to show/hide them - that approach was visually
+  // unreliable (a tab's content wouldn't paint until a later, unrelated
+  // interaction forced a repaint) in at least one real environment.
+  function renderActivePane() {
+    if (!detailPanel) return;
+    detailPanel.querySelector("#detailBody").innerHTML = paneContent[state.activeTab] || "";
   }
 
   async function selectRecord(id) {
@@ -368,20 +376,19 @@ export async function mount(root, routeParams) {
     state.detailRequestId += 1;
     const requestId = state.detailRequestId;
     highlightSelectedRow();
-    const panel = ensureDetailPanel();
+    ensureDetailPanel();
     layout.classList.add("detail-open");
-    panel.querySelector('[data-pane="normalized"]').innerHTML = '<div class="muted">Loading...</div>';
-    panel.querySelector('[data-pane="raw"]').innerHTML = '<div class="muted">Loading...</div>';
-    panel.querySelector('[data-pane="churn"]').innerHTML = '<div class="muted">Loading...</div>';
+    const loading = '<div class="muted">Loading...</div>';
+    paneContent = { normalized: loading, raw: loading, churn: loading };
+    renderActivePane();
     let record;
     try {
       record = await api.getRecord(id);
     } catch (error) {
       if (requestId !== state.detailRequestId) return;
       const message = '<div class="status-line error">' + esc(error.message) + "</div>";
-      panel.querySelector('[data-pane="normalized"]').innerHTML = message;
-      panel.querySelector('[data-pane="raw"]').innerHTML = message;
-      panel.querySelector('[data-pane="churn"]').innerHTML = message;
+      paneContent = { normalized: message, raw: message, churn: message };
+      renderActivePane();
       return;
     }
     if (requestId !== state.detailRequestId) return;
@@ -401,9 +408,12 @@ export async function mount(root, routeParams) {
       kv("Disconnect", record.disconnectReason) +
       kv("Trace ID", record.traceId) +
       kv("Source", record.sourceKey + ":" + record.lineNumber);
-    panel.querySelector('[data-pane="normalized"]').innerHTML = '<div class="kv">' + normalized + "</div>";
-    panel.querySelector('[data-pane="raw"]').innerHTML = '<pre class="raw-json">' + esc(JSON.stringify(record.raw, null, 2)) + "</pre>";
-    panel.querySelector('[data-pane="churn"]').innerHTML = churnPanel(record.churn, timeZone);
+    paneContent = {
+      normalized: '<div class="kv">' + normalized + "</div>",
+      raw: '<pre class="raw-json">' + esc(JSON.stringify(record.raw, null, 2)) + "</pre>",
+      churn: churnPanel(record.churn, timeZone)
+    };
+    renderActivePane();
   }
 
   function closeDetail() {
