@@ -115,7 +115,7 @@ label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; font-weig
 .investigate-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; gap: 8px; }
 .search-row { display: flex; gap: 8px; flex: 0 0 auto; }
 .search-row input[type="text"] { flex: 1 1 auto; }
-.table-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); contain: layout; }
+.table-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
 table.events { width: max-content; min-width: 100%; table-layout: fixed; border-collapse: collapse; }
 table.events th, table.events td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; }
 table.events th { color: var(--muted); background: #f1f5f9; font-size: 11.5px; position: sticky; top: 0; z-index: 1; user-select: none; }
