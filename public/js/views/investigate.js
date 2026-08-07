@@ -130,20 +130,18 @@ export async function mount(root, routeParams) {
       '<header class="view-header">' +
         "<h1>Investigate</h1>" +
         '<div class="actions">' +
-          '<button type="button" class="secondary" id="toggleFilters">Filters</button>' +
           '<button type="button" class="secondary" id="clearFilters">Clear</button>' +
           '<button type="button" class="secondary" id="reloadButton">Reload</button>' +
         "</div>" +
       "</header>" +
       '<div class="investigate-layout" id="investigateLayout">' +
-        '<div class="filter-backdrop" id="filterBackdrop"></div>' +
-        '<aside class="filter-sidebar" id="filterSidebar">' +
-          '<div class="filter-field"><label for="qInput">Search</label><input type="text" id="qInput" placeholder="user, IP, operation, device, trace id" autocomplete="off"></div>' +
-          '<div id="multiFieldsRoot"></div>' +
-          '<div class="filter-field"><label>Date range</label><div class="range-row"><input type="date" id="fStart" aria-label="Start date"><input type="date" id="fEnd" aria-label="End date"></div></div>' +
-          '<div class="filter-field"><label>Duration (seconds)</label><div class="range-row"><input type="number" id="fDurationMin" placeholder="Min"><input type="number" id="fDurationMax" placeholder="Max"></div></div>' +
-        "</aside>" +
         '<div class="investigate-main">' +
+          '<div class="filter-toolbar" id="filterToolbar">' +
+            '<div class="filter-field wide"><label for="qInput">Search</label><input type="text" id="qInput" placeholder="user, IP, operation, device, trace id" autocomplete="off"></div>' +
+            '<div id="multiFieldsRoot"></div>' +
+            '<div class="filter-field"><label>Date range</label><div class="range-row"><input type="date" id="fStart" aria-label="Start date"><input type="date" id="fEnd" aria-label="End date"></div></div>' +
+            '<div class="filter-field"><label>Duration (seconds)</label><div class="range-row"><input type="number" id="fDurationMin" placeholder="Min"><input type="number" id="fDurationMax" placeholder="Max"></div></div>' +
+          "</div>" +
           '<div class="status-line" id="statusLine"></div>' +
           '<div class="table-scroll"><table class="events" id="eventsTable"></table><div class="table-footer" id="tableFooter" hidden><button type="button" class="secondary" id="loadMoreButton">Load more</button></div></div>' +
         "</div>" +
@@ -160,8 +158,6 @@ export async function mount(root, routeParams) {
   const tableFooter = root.querySelector("#tableFooter");
   const loadMoreButton = root.querySelector("#loadMoreButton");
   const layout = root.querySelector("#investigateLayout");
-  const filterSidebar = root.querySelector("#filterSidebar");
-  const filterBackdrop = root.querySelector("#filterBackdrop");
 
   const multiFieldsRoot = root.querySelector("#multiFieldsRoot");
   const multiFields = MULTI_FIELDS.map((field) => createMultiField(multiFieldsRoot, field));
@@ -290,15 +286,6 @@ export async function mount(root, routeParams) {
   });
 
   loadMoreButton.addEventListener("click", () => search({ append: true }).catch(console.error));
-
-  root.querySelector("#toggleFilters").addEventListener("click", () => {
-    filterSidebar.classList.toggle("open");
-    filterBackdrop.classList.toggle("open");
-  });
-  filterBackdrop.addEventListener("click", () => {
-    filterSidebar.classList.remove("open");
-    filterBackdrop.classList.remove("open");
-  });
 
   eventsTable.addEventListener("click", (event) => {
     const th = event.target.closest("th.sortable");
