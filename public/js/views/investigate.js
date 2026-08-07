@@ -141,7 +141,7 @@ export async function mount(root, routeParams) {
         '<aside class="filter-sidebar" id="filterSidebar">' +
           '<div class="filter-field"><label for="qInput">Search</label><input type="text" id="qInput" placeholder="user, IP, operation, device, trace id" autocomplete="off"></div>' +
           '<div id="multiFieldsRoot"></div>' +
-          '<div class="filter-field"><label>Date range</label><div class="range-row"><input type="text" id="fStart" placeholder="Start (2026-05-01)"><input type="text" id="fEnd" placeholder="End"></div></div>' +
+          '<div class="filter-field"><label>Date range</label><div class="range-row"><input type="date" id="fStart" aria-label="Start date"><input type="date" id="fEnd" aria-label="End date"></div></div>' +
           '<div class="filter-field"><label>Duration (seconds)</label><div class="range-row"><input type="number" id="fDurationMin" placeholder="Min"><input type="number" id="fDurationMax" placeholder="Max"></div></div>' +
           '<div class="filter-field"><h3>Saved views</h3><div class="saved-view-add"><input type="text" id="savedViewName" placeholder="View name"><button type="button" class="secondary" id="saveViewButton">Save</button></div><div class="saved-views-list" id="savedViewsList"></div></div>' +
         "</aside>" +
@@ -180,7 +180,7 @@ export async function mount(root, routeParams) {
       if (field.values.size) params.set(field.key, [...field.values].join(","));
     }
     if (state.start) params.set("start", state.start);
-    if (state.end) params.set("end", state.end);
+    if (state.end) params.set("end", /^\d{4}-\d{2}-\d{2}$/.test(state.end) ? state.end + "T23:59:59" : state.end);
     if (state.durationMin) params.set("durationSecondsMin", state.durationMin);
     if (state.durationMax) params.set("durationSecondsMax", state.durationMax);
     params.set("sort", state.sort);
