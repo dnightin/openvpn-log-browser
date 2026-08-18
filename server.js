@@ -1194,7 +1194,7 @@ async function saveParsedObjectsToMysql(sourceId, sourceHash, parsedObjects) {
         const batch = eventRows.slice(index, index + 500);
         const placeholders = batch.map(() => `(${columns.map(() => "?").join(",")})`).join(",");
         await connection.query(
-          `INSERT INTO log_events (${columns.join(",")}) VALUES ${placeholders}`,
+          `INSERT INTO log_events (${columns.join(",")}) VALUES ${placeholders} ON DUPLICATE KEY UPDATE ${columns.filter((column) => column !== "id_hash").map((column) => `${column}=VALUES(${column})`).join(",")}`,
           batch.flat()
         );
       }
