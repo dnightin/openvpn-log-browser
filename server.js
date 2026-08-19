@@ -10,6 +10,16 @@ const { promisify } = require("node:util");
 
 const gunzip = promisify(zlib.gunzip);
 
+// Defense in depth: a single unhandled rejection anywhere (a missed `await`,
+// an unexpected error from a library, a future bug) should not be able to
+// crash the whole process and take the app down for every user. Node's
+// default behavior for unhandled rejections is to exit; log and keep running
+// instead. The request handler's own try/catch is the primary safety net -
+// this only exists to catch what that one misses.
+process.on("unhandledRejection", (error) => {
+  console.error("Unhandled promise rejection (continuing):", error);
+});
+
 const PORT = Number(process.env.PORT || 3000);
 const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
 const S3_CACHE_DIR = process.env.S3_CACHE_DIR || path.join(__dirname, "data", "s3-cache");
@@ -1486,9 +1496,18 @@ function encodeSearchCursor(record) {
 }
 
 function mysqlBooleanSearchQuery(value) {
+  // Split on anything non-alphanumeric rather than keeping punctuation
+  // (@ . - : etc.) glued to a term. Two reasons: MySQL/MariaDB's default
+  // fulltext parser tokenizes indexed text the same way (so "a@b.edu" is
+  // stored as three separate word tokens, not one), and several of those
+  // punctuation characters are MEANINGFUL OPERATORS in boolean-mode query
+  // syntax (@ in particular is invalid outside a quoted-phrase distance
+  // clause) - passing one through unescaped is a MySQL syntax error, and
+  // since that error was previously unhandled, it crashed the whole
+  // process (see the fix to route error handling near handleQuery).
   const terms = String(value || "")
     .toLowerCase()
-    .match(/[a-z0-9@._:-]+/g);
+    .match(/[a-z0-9]+/g);
   if (!terms || !terms.length) return "";
   return terms.slice(0, 12).map((term) => `+${term}${term.length >= 3 ? "*" : ""}`).join(" ");
 }
@@ -2981,9 +3000,9 @@ async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     label = `${req.method} ${url.pathname}`;
-    if (url.pathname === "/auth/saml/login") return samlLogin(req, res);
-    if (url.pathname === "/auth/saml/callback" && req.method === "POST") return samlCallback(req, res);
-    if (url.pathname === "/auth/saml/metadata") return samlMetadata(req, res);
+    if (url.pathname === "/auth/saml/login") return await samlLogin(req, res);
+    if (url.pathname === "/auth/saml/callback" && req.method === "POST") return await samlCallback(req, res);
+    if (url.pathname === "/auth/saml/metadata") return await samlMetadata(req, res);
     if (url.pathname === "/auth/logout") {
       clearSession(req, res);
       return redirect(res, "/");
@@ -3040,7 +3059,7 @@ async function handler(req, res) {
         rows: result.rows.map(({ searchText, raw, ...record }) => record)
       });
     }
-    if (url.pathname === "/api/query") return handleQuery(req, res, url);
+    if (url.pathname === "/api/query") return await handleQuery(req, res, url);
     if (url.pathname === "/api/record") {
       const id = url.searchParams.get("id");
       const record = mysqlLogIndexAvailable() ? await recordFromMysql(id) : store.records.find((item) => item.id === id);
