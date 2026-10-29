@@ -64,6 +64,7 @@ AUTO_REFRESH_MINUTES=30
 ACTIVE_SESSION_MAX_AGE_HOURS=6
 WEB_INGEST_ENABLED=false
 LOG_INDEX_RETENTION_DAYS=0
+S3_CACHE_PRUNE_UNINDEXED=false
 SLOW_API_MS=500
 SLOW_DB_MS=500
 
@@ -199,6 +200,10 @@ Put values such as `MYSQL_PASSWORD`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS
 For S3 sources, reloads are incremental. The app lists the bucket, compares each object's ETag, size, and last-modified timestamp, and downloads only new or changed objects. Unchanged objects reuse their in-memory parsed records while the server stays running, the MariaDB parsed-log index after a restart, or the local S3 object cache when an object needs to be reparsed.
 
 The local S3 object cache is stored under `S3_CACHE_DIR`, which defaults to `data/s3-cache` inside the app directory. The cache stores gzipped log objects and `manifest.json`; protect this directory like VPN logs. It is ignored by Git.
+
+The cache is best-effort: if a cache file cannot be read or written (for example, the disk is full), the object is still downloaded, parsed, and indexed, and the worker logs one `s3-cache-error` line per run with the failure count.
+
+After each load the cache is pruned so it tracks the bucket instead of growing forever. A cached file is deleted once its object no longer appears in the S3 listing (for example, after the bucket's lifecycle rule expires it) and the object is in the MariaDB parsed-log index. Stale `*.tmp` files older than an hour are also removed. Expired files that were never indexed are kept by default, because they may be the only remaining copy of those logs; set `S3_CACHE_PRUNE_UNINDEXED=true` to delete them too (also the setting to use without MariaDB). Each run logs an `s3-cache-prune` line with `removed`, `removedBytes`, `removedTemp`, and `keptUnindexed` counts.
 
 After a service restart, the app hydrates from the MariaDB parsed-log index first, then refreshes S3 in the background. If MariaDB has no indexed copy of an unchanged object yet, the loader parses from the local S3 object cache where possible and only downloads objects missing from disk or changed in S3.
 
