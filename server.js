@@ -33,6 +33,7 @@ const LOAD_BATCH_DELAY_MS = Math.max(0, Number(process.env.LOAD_BATCH_DELAY_MS |
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 6));
 const LOG_INDEX_RETENTION_DAYS = Math.max(0, Number(process.env.LOG_INDEX_RETENTION_DAYS || 0));
+const LOG_INDEX_RETENTION_BATCH_OBJECTS = 200;
 const S3_CACHE_PRUNE_UNINDEXED = toBool(process.env.S3_CACHE_PRUNE_UNINDEXED);
 const SLOW_API_MS = Math.max(0, Number(process.env.SLOW_API_MS || 500));
 const SLOW_DB_MS = Math.max(0, Number(process.env.SLOW_DB_MS || 500));
@@ -1197,22 +1198,35 @@ async function saveConnectedCountSample() {
   }
 }
 
+// Deletes a few objects at a time. One DELETE over a large backlog (retention newly enabled on a
+// big index) ran as a single transaction for hours and stalled the worker.
 async function pruneLogIndexRetention(sourceHash) {
   if (!mysqlPool || !mysqlLogIndexReady || !LOG_INDEX_RETENTION_DAYS) return;
-  await mysqlPool.execute(
-    `DELETE e FROM log_events e
-     JOIN log_s3_objects o
-       ON o.source_hash = e.source_hash AND o.object_hash = e.object_hash
-     WHERE e.source_hash = ?
-       AND o.last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY`,
-    [sourceHash, LOG_INDEX_RETENTION_DAYS]
-  );
-  await mysqlPool.execute(
-    `DELETE FROM log_s3_objects
-     WHERE source_hash = ?
-       AND last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY`,
-    [sourceHash, LOG_INDEX_RETENTION_DAYS]
-  );
+  const removed = { objects: 0, events: 0 };
+  for (;;) {
+    const [rows] = await mysqlPool.execute(
+      `SELECT object_hash FROM log_s3_objects
+       WHERE source_hash = ?
+         AND last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY
+       LIMIT ${LOG_INDEX_RETENTION_BATCH_OBJECTS}`,
+      [sourceHash, LOG_INDEX_RETENTION_DAYS]
+    );
+    if (!rows.length) break;
+    const objectHashes = rows.map((row) => row.object_hash);
+    const [events] = await mysqlPool.query(
+      "DELETE FROM log_events WHERE source_hash = ? AND object_hash IN (?)",
+      [sourceHash, objectHashes]
+    );
+    const [objects] = await mysqlPool.query(
+      "DELETE FROM log_s3_objects WHERE source_hash = ? AND object_hash IN (?)",
+      [sourceHash, objectHashes]
+    );
+    removed.events += events.affectedRows;
+    removed.objects += objects.affectedRows;
+  }
+  if (removed.objects) {
+    console.log(JSON.stringify({ timestamp: new Date().toISOString(), kind: "log-index-retention", ...removed }));
+  }
 }
 
 function mysqlDate(date) {
