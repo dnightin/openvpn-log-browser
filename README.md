@@ -53,6 +53,7 @@ If the current machine cannot list the bucket, run it from any authorized host w
 
 ```text
 PORT=3000
+HOST=
 RAW_DIR=data/raw
 S3_CACHE_DIR=data/s3-cache
 SETTINGS_DIR=data/settings
@@ -139,6 +140,8 @@ SAML settings can also be managed in the app from `Menu` -> `Settings`. The app 
 If neither is set, settings changes are rejected with `403` and the server logs a startup warning. Reading settings (`GET /api/settings/saml`, `GET /api/settings/source`) is not gated, since it returns no secrets (the IdP certificate is a public certificate, not a private key).
 
 Sessions expire after `SESSION_IDLE_TIMEOUT_MINUTES` (default `720`, i.e. 12 hours) of inactivity. Set `TRUST_PROXY=true` only when the app sits behind a reverse proxy you control that sets `X-Forwarded-Proto` correctly; this affects SAML callback/metadata URL generation and whether the session cookie is marked `Secure`. Leaving it `false` (the default) derives the protocol from the actual TCP connection instead of trusting a client-settable header.
+
+`HOST` sets the listen address. Empty (the default) listens on all interfaces. Behind a reverse proxy on the same machine, set `HOST=127.0.0.1` so clients can't bypass the proxy (and its TLS and login) by connecting to `PORT` directly.
 
 ## Log Source Settings
 
