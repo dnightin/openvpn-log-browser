@@ -33,6 +33,8 @@ const LOAD_BATCH_DELAY_MS = Math.max(0, Number(process.env.LOAD_BATCH_DELAY_MS |
 const AUTO_REFRESH_MINUTES = Math.max(0, Number(process.env.AUTO_REFRESH_MINUTES || 30));
 const ACTIVE_SESSION_MAX_AGE_HOURS = Math.max(1, Number(process.env.ACTIVE_SESSION_MAX_AGE_HOURS || 6));
 const LOG_INDEX_RETENTION_DAYS = Math.max(0, Number(process.env.LOG_INDEX_RETENTION_DAYS || 0));
+const LOG_INDEX_RETENTION_BATCH_OBJECTS = 200;
+const S3_CACHE_PRUNE_UNINDEXED = toBool(process.env.S3_CACHE_PRUNE_UNINDEXED);
 const SLOW_API_MS = Math.max(0, Number(process.env.SLOW_API_MS || 500));
 const SLOW_DB_MS = Math.max(0, Number(process.env.SLOW_DB_MS || 500));
 const SESSION_COOKIE = "openvpn_log_browser_session";
@@ -563,7 +565,8 @@ async function walk(dir) {
   const files = [];
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) files.push(...await walk(full));
+    // Not push(...): spreading a directory of 100k+ files overflows the call stack.
+    if (entry.isDirectory()) for (const file of await walk(full)) files.push(file);
     if (entry.isFile()) files.push(full);
   }
   return files;
@@ -695,6 +698,12 @@ async function loadFromS3() {
   let reusedMysql = 0;
   let downloaded = 0;
   let batchesSinceManifestSave = 0;
+  // The disk cache only saves re-downloads; a full or broken disk must not stop indexing.
+  const cacheErrors = [];
+  const noteCacheError = (action) => (error) => {
+    cacheErrors.push(`${action}: ${error.message}`);
+    return null;
+  };
 
   for (const object of objects) {
     seenKeys.add(object.key);
@@ -723,14 +732,14 @@ async function loadFromS3() {
     const batchResults = await Promise.all(batch.map(async (object) => {
       const cached = objectRecordCache.get(object.key);
       try {
-        let compressed = await readCachedS3Object(manifest, object);
+        let compressed = await readCachedS3Object(manifest, object).catch(noteCacheError(`read ${object.key}`));
         if (compressed) {
           reusedDisk += 1;
         } else {
           compressed = apiMode
             ? await getObjectBufferApi(config, object.key, client)
             : await httpGetBuffer(config.bucketUrl + object.key.split("/").map(encodeURIComponent).join("/"));
-          await writeCachedS3Object(manifest, object, compressed);
+          await writeCachedS3Object(manifest, object, compressed).catch(noteCacheError(`write ${object.key}`));
           downloaded += 1;
         }
         const parsed = await parseJsonlGz(compressed, object.key);
@@ -758,12 +767,29 @@ async function loadFromS3() {
     };
     batchesSinceManifestSave += 1;
     if (batchesSinceManifestSave >= 25) {
-      await saveS3CacheManifest(manifest, seenKeys);
+      await saveS3CacheManifest(manifest, seenKeys).catch(noteCacheError("save manifest"));
       batchesSinceManifestSave = 0;
     }
     await yieldToEventLoop(LOAD_BATCH_DELAY_MS);
   }
-  await saveS3CacheManifest(manifest, seenKeys);
+  await saveS3CacheManifest(manifest, seenKeys).catch(noteCacheError("save manifest"));
+  if (cacheErrors.length) {
+    console.warn(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      kind: "s3-cache-error",
+      count: cacheErrors.length,
+      first: cacheErrors[0]
+    }));
+  }
+  // An empty listing more likely means a bad source setting than an empty bucket.
+  if (seenKeys.size) {
+    try {
+      const pruned = await pruneS3Cache(seenKeys, mysqlIndex);
+      console.log(JSON.stringify({ timestamp: new Date().toISOString(), kind: "s3-cache-prune", ...pruned }));
+    } catch (error) {
+      console.error("S3 cache prune failed:", error);
+    }
+  }
   await pruneLogIndexRetention(sourceHash);
   return {
     records,
@@ -805,12 +831,23 @@ async function saveS3CacheManifest(manifest, seenKeys) {
     if (!seenKeys.has(key)) delete manifest.objects[key];
   }
   await fs.mkdir(S3_CACHE_DIR, { recursive: true });
-  await fs.writeFile(S3_CACHE_MANIFEST_PATH, JSON.stringify({
+  await writeFileAtomic(S3_CACHE_MANIFEST_PATH, JSON.stringify({
     version: 1,
     sourceId: manifest.sourceId,
     updatedAt: new Date().toISOString(),
     objects: manifest.objects
   }, null, 2));
+}
+
+async function writeFileAtomic(filePath, data) {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    await fs.writeFile(tempPath, data);
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function readCachedS3Object(manifest, object) {
@@ -840,10 +877,47 @@ async function readCachedS3Object(manifest, object) {
 async function writeCachedS3Object(manifest, object, compressed) {
   const filePath = cachePathForS3Key(object.key);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.tmp`;
-  await fs.writeFile(tempPath, compressed);
-  await fs.rename(tempPath, filePath);
+  await writeFileAtomic(filePath, compressed);
   manifest.objects[object.key] = cacheManifestEntry(object, filePath);
+}
+
+// The bucket's lifecycle rule expires old objects, but their cache files would otherwise stay
+// forever. Drop a file once its object has left the listing and MariaDB holds its events. An
+// expired, unindexed file may be the only remaining copy, so it is kept unless
+// S3_CACHE_PRUNE_UNINDEXED is set.
+async function pruneS3Cache(seenKeys, mysqlIndex) {
+  const result = { removed: 0, removedBytes: 0, removedTemp: 0, keptUnindexed: 0 };
+  const tempCutoffMs = Date.now() - 60 * 60 * 1000;
+  for (const filePath of await walk(S3_CACHE_OBJECT_DIR)) {
+    if (filePath.endsWith(".tmp")) {
+      // Left behind by a crash mid-write; skip recent ones another process may still be writing.
+      const stat = await fs.stat(filePath);
+      if (stat.mtimeMs < tempCutoffMs) {
+        await fs.rm(filePath, { force: true });
+        result.removedTemp += 1;
+      }
+      continue;
+    }
+    const key = s3KeyForCachePath(filePath);
+    if (!key || seenKeys.has(key)) continue;
+    if (!S3_CACHE_PRUNE_UNINDEXED && !(mysqlIndex && mysqlIndex.has(key))) {
+      result.keptUnindexed += 1;
+      continue;
+    }
+    const stat = await fs.stat(filePath);
+    await fs.rm(filePath, { force: true });
+    result.removed += 1;
+    result.removedBytes += stat.size;
+  }
+  return result;
+}
+
+function s3KeyForCachePath(filePath) {
+  try {
+    return path.relative(S3_CACHE_OBJECT_DIR, filePath).split(path.sep).map(decodeURIComponent).join("/");
+  } catch {
+    return null;
+  }
 }
 
 function cacheManifestEntry(object, filePath) {
@@ -1124,22 +1198,35 @@ async function saveConnectedCountSample() {
   }
 }
 
+// Deletes a few objects at a time. One DELETE over a large backlog (retention newly enabled on a
+// big index) ran as a single transaction for hours and stalled the worker.
 async function pruneLogIndexRetention(sourceHash) {
   if (!mysqlPool || !mysqlLogIndexReady || !LOG_INDEX_RETENTION_DAYS) return;
-  await mysqlPool.execute(
-    `DELETE e FROM log_events e
-     JOIN log_s3_objects o
-       ON o.source_hash = e.source_hash AND o.object_hash = e.object_hash
-     WHERE e.source_hash = ?
-       AND o.last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY`,
-    [sourceHash, LOG_INDEX_RETENTION_DAYS]
-  );
-  await mysqlPool.execute(
-    `DELETE FROM log_s3_objects
-     WHERE source_hash = ?
-       AND last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY`,
-    [sourceHash, LOG_INDEX_RETENTION_DAYS]
-  );
+  const removed = { objects: 0, events: 0 };
+  for (;;) {
+    const [rows] = await mysqlPool.execute(
+      `SELECT object_hash FROM log_s3_objects
+       WHERE source_hash = ?
+         AND last_modified < UTC_TIMESTAMP() - INTERVAL ? DAY
+       LIMIT ${LOG_INDEX_RETENTION_BATCH_OBJECTS}`,
+      [sourceHash, LOG_INDEX_RETENTION_DAYS]
+    );
+    if (!rows.length) break;
+    const objectHashes = rows.map((row) => row.object_hash);
+    const [events] = await mysqlPool.query(
+      "DELETE FROM log_events WHERE source_hash = ? AND object_hash IN (?)",
+      [sourceHash, objectHashes]
+    );
+    const [objects] = await mysqlPool.query(
+      "DELETE FROM log_s3_objects WHERE source_hash = ? AND object_hash IN (?)",
+      [sourceHash, objectHashes]
+    );
+    removed.events += events.affectedRows;
+    removed.objects += objects.affectedRows;
+  }
+  if (removed.objects) {
+    console.log(JSON.stringify({ timestamp: new Date().toISOString(), kind: "log-index-retention", ...removed }));
+  }
 }
 
 function mysqlDate(date) {
@@ -2737,6 +2824,7 @@ async function healthSummary() {
       fetchConcurrency: FETCH_CONCURRENCY,
       activeSessionMaxAgeHours: ACTIVE_SESSION_MAX_AGE_HOURS,
       logIndexRetentionDays: LOG_INDEX_RETENTION_DAYS,
+      s3CachePruneUnindexed: S3_CACHE_PRUNE_UNINDEXED,
       slowApiMs: SLOW_API_MS,
       slowDbMs: SLOW_DB_MS
     },
