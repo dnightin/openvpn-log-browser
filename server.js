@@ -1044,6 +1044,8 @@ async function ensureMysqlLogIndexes() {
   await ensureMysqlIndex("log_events", "source_event_time_idx", "ALTER TABLE log_events ADD KEY source_event_time_idx (source_hash, event_name, timestamp_dt)");
   await ensureMysqlIndex("log_events", "source_user_time_idx", "ALTER TABLE log_events ADD KEY source_user_time_idx (source_hash, user_name, timestamp_dt)");
   await ensureMysqlIndex("log_events", "source_category_time_idx", "ALTER TABLE log_events ADD KEY source_category_time_idx (source_hash, category, timestamp_dt)");
+  // Lets the per-day stats count (rebuilt after every ingest) read the index instead of every row.
+  await ensureMysqlIndex("log_events", "source_date_idx", "ALTER TABLE log_events ADD KEY source_date_idx (source_hash, date_text)");
 }
 
 async function ensureMysqlIndex(tableName, indexName, statement) {
