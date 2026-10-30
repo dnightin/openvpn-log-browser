@@ -21,6 +21,8 @@ process.on("unhandledRejection", (error) => {
 });
 
 const PORT = Number(process.env.PORT || 3000);
+// Empty listens on all interfaces; set 127.0.0.1 when a local reverse proxy is the only client.
+const HOST = process.env.HOST || "";
 const RAW_DIR = process.env.RAW_DIR || path.join(__dirname, "data", "raw");
 const S3_CACHE_DIR = process.env.S3_CACHE_DIR || path.join(__dirname, "data", "s3-cache");
 const S3_CACHE_OBJECT_DIR = path.join(S3_CACHE_DIR, "objects");
@@ -3209,8 +3211,8 @@ if (process.argv.includes("--ingest")) {
     process.exit(1);
   });
 } else {
-  http.createServer(handler).listen(PORT, () => {
-    console.log(`OpenVPN Log Search listening on http://localhost:${PORT}`);
+  http.createServer(handler).listen(PORT, HOST || undefined, () => {
+    console.log(`OpenVPN Log Search listening on http://${HOST || "localhost"}:${PORT}`);
     if (!adminConfigured()) {
       console.warn("SECURITY WARNING: ADMIN_SETUP_TOKEN/ADMIN_EMAILS are not set. Settings changes (/api/settings/saml, /api/settings/source) are disabled until one is configured.");
     }
